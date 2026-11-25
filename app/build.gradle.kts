@@ -27,11 +27,26 @@ android {
   // and updating Android apps in AI Studio.
   signingConfigs {
     create("release") {
-      val keystorePath = System.getenv("KEYSTORE_PATH") ?: "${rootDir}/my-upload-key.jks"
-      storeFile = file(keystorePath)
-      storePassword = System.getenv("STORE_PASSWORD")
-      keyAlias = "upload"
-      keyPassword = System.getenv("KEY_PASSWORD")
+      val signingKeyPath = System.getenv("SIGNING_KEY_PATH")
+      if (!signingKeyPath.isNullOrBlank()) {
+        storeFile = file(signingKeyPath)
+        storePassword = System.getenv("KEY_STORE_PASSWORD")
+        keyAlias = System.getenv("ALIAS")
+        keyPassword = System.getenv("KEY_PASSWORD")
+      } else {
+        val keystorePath = System.getenv("KEYSTORE_PATH")
+        if (!keystorePath.isNullOrBlank()) {
+          storeFile = file(keystorePath)
+          storePassword = System.getenv("STORE_PASSWORD")
+          keyAlias = "upload"
+          keyPassword = System.getenv("KEY_PASSWORD")
+        } else {
+          storeFile = file("${rootDir}/debug.keystore")
+          storePassword = "android"
+          keyAlias = "androiddebugkey"
+          keyPassword = "android"
+        }
+      }
     }
     create("debugConfig") {
       storeFile = file("${rootDir}/debug.keystore")
@@ -45,6 +60,7 @@ android {
     release {
       isCrunchPngs = false
       isMinifyEnabled = false
+      isShrinkResources = false
       proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
       // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
       // AI Studio.
