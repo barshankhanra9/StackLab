@@ -53,9 +53,23 @@ jobs:
         if: always()
         run: rm -f app/release.jks
 
-      - name: Upload signed release APKs
+      - name: Upload Universal Signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: StackLab-Signed-Release
-          path: app/build/outputs/apk/release/*.apk
+          name: StackLab-Signed-Release-Universal
+          path: app/build/outputs/apk/release/*universal*.apk
+          if-no-files-found: error
+
+      - name: Upload armeabi-v7a Signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StackLab-Signed-Release-armeabi-v7a
+          path: app/build/outputs/apk/release/*armeabi-v7a*.apk
+          if-no-files-found: error
+
+      - name: Upload arm64-v8a Signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StackLab-Signed-Release-arm64-v8a
+          path: app/build/outputs/apk/release/*arm64-v8a*.apk
           if-no-files-found: error
