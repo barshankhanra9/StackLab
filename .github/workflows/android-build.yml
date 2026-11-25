@@ -61,25 +61,44 @@ jobs:
         id: build
         env:
           INPUT_BUILD_TYPE: ${{ github.event.inputs.build_type || 'auto' }}
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          HAS_RELEASE_SECRETS=false
+          HAS_SIGNING_KEY=false
+          if [ -n "$SIGNING_KEY" ] && [ -n "$ALIAS" ] && [ -n "$KEY_STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            HAS_SIGNING_KEY=true
+          fi
+
+          HAS_LEGACY_KEYSTORE=false
           if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            HAS_LEGACY_KEYSTORE=true
+          fi
+
+          HAS_RELEASE_SECRETS=false
+          if [ "$HAS_SIGNING_KEY" = "true" ] || [ "$HAS_LEGACY_KEYSTORE" = "true" ]; then
             HAS_RELEASE_SECRETS=true
           fi
 
           if [ "$INPUT_BUILD_TYPE" = "release" ] && [ "$HAS_RELEASE_SECRETS" != "true" ]; then
-            echo "::error::Release build requested, but KEYSTORE_BASE64, STORE_PASSWORD, or KEY_PASSWORD secrets are missing."
+            echo "::error::Release build requested, but signing secrets (SIGNING_KEY, ALIAS, KEY_STORE_PASSWORD, KEY_PASSWORD) are missing."
             exit 1
           fi
 
           if [ "$INPUT_BUILD_TYPE" = "release" ] || { [ "$INPUT_BUILD_TYPE" = "auto" ] && [ "$HAS_RELEASE_SECRETS" = "true" ]; }; then
             VARIANT="release"
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release-keystore.jks"
-            export KEYSTORE_PATH="$RUNNER_TEMP/release-keystore.jks"
+            if [ "$HAS_SIGNING_KEY" = "true" ]; then
+              echo "$SIGNING_KEY" | base64 --decode > app/release.jks
+              export SIGNING_KEY_PATH="release.jks"
+            else
+              echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release-keystore.jks"
+              export KEYSTORE_PATH="$RUNNER_TEMP/release-keystore.jks"
+            fi
             gradle assembleRelease --no-daemon
+            rm -f app/release.jks
           else
             VARIANT="debug"
             gradle assembleDebug --no-daemon

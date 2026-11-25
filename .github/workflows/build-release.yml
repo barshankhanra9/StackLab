@@ -1,4 +1,4 @@
-name: Build Signed Release APK
+name: Build Signed Release APKs
 
 on:
   push:
@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-release:
-    name: Build Signed Release APK
+    name: Build 3 Signed Release APKs (Universal, armeabi-v7a, arm64-v8a)
     runs-on: ubuntu-latest
 
     steps:
@@ -39,7 +39,7 @@ jobs:
         run: |
           echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > app/release.jks
 
-      - name: Build signed release APK
+      - name: Build 3 signed release APKs
         env:
           SIGNING_KEY_PATH: release.jks
           ALIAS: ${{ secrets.ALIAS }}
@@ -47,17 +47,43 @@ jobs:
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           ./gradlew assembleRelease
-          if [ ! -f app/build/outputs/apk/release/app-release.apk ] && [ -f app/build/outputs/apk/release/app-universal-release.apk ]; then
-            cp app/build/outputs/apk/release/app-universal-release.apk app/build/outputs/apk/release/app-release.apk
-          fi
+
+          APK_DIR="app/build/outputs/apk/release"
+          mkdir -p dist-apks
+          cp "$APK_DIR/app-universal-release.apk" "dist-apks/StackLab-universal-release.apk"
+          cp "$APK_DIR/app-armeabi-v7a-release.apk" "dist-apks/StackLab-old-device-armeabi-v7a-release.apk"
+          cp "$APK_DIR/app-arm64-v8a-release.apk" "dist-apks/StackLab-new-device-arm64-v8a-release.apk"
+
+          echo "### Signed Release APKs" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | File | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for f in dist-apks/*.apk; do
+            SIZE=$(du -h "$f" | cut -f1)
+            echo "| $(basename "$f") | \`$f\` | $SIZE |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          ls -lh dist-apks/
 
       - name: Clean up release keystore
         if: always()
         run: rm -f app/release.jks
 
-      - name: Upload signed release APK
+      - name: Upload Universal Signed APK
         uses: actions/upload-artifact@v4
         with:
-          name: StackLab-Signed-Release
-          path: app/build/outputs/apk/release/app-release.apk
+          name: StackLab-Signed-Release-Universal
+          path: dist-apks/StackLab-universal-release.apk
+          if-no-files-found: error
+
+      - name: Upload Old Device Signed APK (armeabi-v7a 32-bit)
+        uses: actions/upload-artifact@v4
+        with:
+          name: StackLab-Signed-Release-armeabi-v7a
+          path: dist-apks/StackLab-old-device-armeabi-v7a-release.apk
+          if-no-files-found: error
+
+      - name: Upload New Device Signed APK (arm64-v8a 64-bit)
+        uses: actions/upload-artifact@v4
+        with:
+          name: StackLab-Signed-Release-arm64-v8a
+          path: dist-apks/StackLab-new-device-arm64-v8a-release.apk
           if-no-files-found: error
