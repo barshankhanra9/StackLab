@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">StackLab</string>
+    <string name="cd_settings">Output Settings</string>
+    <string name="cd_back">Navigate back</string>
+    <string name="cd_focus_stack_hero">Macro photograph showing edge-to-edge focus depth</string>
+    <string name="cd_remove_frame">Remove frame</string>
+    <string name="cd_move_frame_left">Move frame earlier</string>
+    <string name="cd_move_frame_right">Move frame later</string>
+    <string name="cd_add_frames">Add more frames</string>
+    <string name="cd_reset_zoom">Reset zoom and pan</string>
+    <string name="cd_compare_slider">Drag to compare before and after</string>
+    <string name="home_subtitle">Computational Darkroom</string>
+    <string name="focus_stack_title">Focus Stack</string>
+    <string name="focus_stack_subtitle">Merge macro &amp; landscape shots for edge-to-edge sharpness</string>
+    <string name="select_photos">Select Photos</string>
+    <string name="hdr_blend_title">HDR Exposure Blend</string>
+    <string name="hdr_blend_subtitle">Fuse bracketed exposures with natural highlight roll-off</string>
+    <string name="astro_stack_title">Astro / Noise Stack</string>
+    <string name="astro_stack_subtitle">Align starfields &amp; median-stack to suppress sensor noise</string>
+    <string name="coming_soon">Coming Soon</string>
+    <string name="start_stacking">Start Stacking</string>
+    <string name="save_full_res">Save Full-Res</string>
+    <string name="new_stack">New Stack</string>
+    <string name="cancel">Cancel</string>
+</resources>

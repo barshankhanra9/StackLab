@@ -1,0 +1,6 @@
+{
+  "name": "StackLab",
+  "description": "Pro-level computational photography app for macro and landscape focus stacking with OpenCV alignment and Laplacian pyramid blending.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
