@@ -1,6 +1,5 @@
 package com.example.engine
 
-import android.app.ActivityManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -40,47 +39,24 @@ class FrameBitmapLoader(private val context: Context) {
     }
 
     fun evaluateMemoryBudget(
-        frameCount: Int,
+        @Suppress("UNUSED_PARAMETER") frameCount: Int,
         requestedPreset: MaxResolutionPreset
     ): MemoryBudgetDecision {
-        val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        val memInfo = ActivityManager.MemoryInfo()
-        activityManager?.getMemoryInfo(memInfo)
-
-        val isLowRamDevice = activityManager?.isLowRamDevice == true
-        val availableMb = if (memInfo.availMem > 0L) memInfo.availMem / (1024L * 1024L) else 1024L
-        val jvmMaxMb = Runtime.getRuntime().maxMemory() / (1024L * 1024L)
-
-        val autoProxyNeeded = frameCount > 15 || isLowRamDevice || availableMb < 450L || jvmMaxMb < 320L
+        // FocusStackProcessor uses a streaming O(1)-memory pipeline, so the user's
+        // selected resolution mode always overrides any automatic downscaling cap.
         val presetCap = requestedPreset.maxEdgePx
-
-        return when {
-            autoProxyNeeded -> {
-                val capped = if (presetCap != null) minOf(presetCap, PROXY_MAX_EDGE_PX) else PROXY_MAX_EDGE_PX
-                val reason = when {
-                    frameCount > 15 -> "Auto ${capped}px proxy enabled for ${frameCount}-frame stack"
-                    else -> "Auto ${capped}px proxy enabled for device RAM headroom"
-                }
-                MemoryBudgetDecision(
-                    effectiveMaxEdgePx = capped,
-                    usedProxyMode = true,
-                    reason = reason
-                )
-            }
-            presetCap != null -> {
-                MemoryBudgetDecision(
-                    effectiveMaxEdgePx = presetCap,
-                    usedProxyMode = presetCap <= PROXY_MAX_EDGE_PX,
-                    reason = null
-                )
-            }
-            else -> {
-                MemoryBudgetDecision(
-                    effectiveMaxEdgePx = null,
-                    usedProxyMode = false,
-                    reason = null
-                )
-            }
+        return if (presetCap != null) {
+            MemoryBudgetDecision(
+                effectiveMaxEdgePx = presetCap,
+                usedProxyMode = presetCap <= PROXY_MAX_EDGE_PX,
+                reason = null
+            )
+        } else {
+            MemoryBudgetDecision(
+                effectiveMaxEdgePx = null,
+                usedProxyMode = false,
+                reason = null
+            )
         }
     }
 
@@ -96,16 +72,17 @@ class FrameBitmapLoader(private val context: Context) {
         val orientedW = if (rotated) rawH else rawW
         val orientedH = if (rotated) rawW else rawH
 
-        val desiredMaxEdge = when {
-            targetWidth != null && targetHeight != null -> max(targetWidth, targetHeight)
-            maxEdgePx != null -> maxEdgePx
-            else -> max(orientedW, orientedH)
+        val sampleSize = when {
+            targetWidth != null && targetHeight != null ->
+                calculateInSampleSize(orientedW, orientedH, max(targetWidth, targetHeight))
+            maxEdgePx != null ->
+                calculateInSampleSize(orientedW, orientedH, maxEdgePx)
+            else -> 1 // Original Full-Res: always decode at inSampleSize = 1
         }
-
-        val sampleSize = calculateInSampleSize(orientedW, orientedH, desiredMaxEdge)
         val options = BitmapFactory.Options().apply {
             inSampleSize = sampleSize
             inPreferredConfig = Bitmap.Config.ARGB_8888
+            inScaled = false
         }
 
         val decoded = context.contentResolver.openInputStream(uri)?.use { stream ->
@@ -140,6 +117,63 @@ class FrameBitmapLoader(private val context: Context) {
         }
 
         return orientedBitmap
+    }
+
+    fun readOrientedDimensions(uri: Uri, maxEdgePx: Int? = null): Pair<Int, Int> {
+        val (rawW, rawH) = readImageBounds(uri)
+        val orientation = readExifOrientation(uri)
+        val rotated = isRotated90Or270(orientation)
+        val orientedW = (if (rotated) rawH else rawW).coerceAtLeast(1)
+        val orientedH = (if (rotated) rawW else rawH).coerceAtLeast(1)
+
+        if (maxEdgePx == null) {
+            return orientedW to orientedH
+        }
+        val currentMax = max(orientedW, orientedH)
+        if (currentMax <= maxEdgePx) {
+            return orientedW to orientedH
+        }
+        val scale = maxEdgePx.toFloat() / currentMax.toFloat()
+        return (orientedW * scale).roundToInt().coerceAtLeast(1) to
+            (orientedH * scale).roundToInt().coerceAtLeast(1)
+    }
+
+    fun readSubjectDistance(uri: Uri): Float? {
+        return try {
+            context.contentResolver.openInputStream(uri)?.use { stream ->
+                val exif = ExifInterface(stream)
+                val dist = exif.getAttributeDouble(ExifInterface.TAG_SUBJECT_DISTANCE, -1.0)
+                if (dist > 0.0 && dist.isFinite()) dist.toFloat() else null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun loadCachedBitmap(path: String): Bitmap? {
+        return try {
+            val file = java.io.File(path)
+            if (!file.exists()) return null
+            val opts = BitmapFactory.Options().apply {
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+                inMutable = false
+            }
+            BitmapFactory.decodeFile(file.absolutePath, opts)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    fun getRetouchRunDir(runId: String): java.io.File {
+        val root = java.io.File(context.cacheDir, "retouch_frames")
+        if (root.exists()) {
+            root.listFiles()?.forEach { child ->
+                if (child.name != runId) {
+                    child.deleteRecursively()
+                }
+            }
+        }
+        return java.io.File(root, runId).apply { mkdirs() }
     }
 
     fun createPreviewCopy(source: Bitmap, maxEdgePx: Int = 1080): Bitmap {

@@ -8,8 +8,13 @@ import com.example.domain.model.StackFrame
 import com.example.domain.model.StackMode
 import com.example.domain.model.StackProgress
 import com.example.domain.model.StackResult
+import java.io.File
+import java.util.UUID
 import kotlin.coroutines.coroutineContext
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
+import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.ensureActive
 import org.opencv.android.OpenCVLoader
@@ -20,14 +25,17 @@ import org.opencv.core.CvType
 import org.opencv.core.DMatch
 import org.opencv.core.Mat
 import org.opencv.core.MatOfDMatch
+import org.opencv.core.MatOfInt
 import org.opencv.core.MatOfKeyPoint
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
+import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.core.TermCriteria
 import org.opencv.features2d.BFMatcher
 import org.opencv.features2d.ORB
+import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
 import org.opencv.video.Video
 
@@ -36,6 +44,12 @@ class FocusStackProcessor(
 ) : StackProcessor<FocusStackConfig> {
 
     override val mode: StackMode = StackMode.FocusStack
+
+    private sealed interface FrameTransform {
+        data object Identity : FrameTransform
+        data class Affine(val matrix2x3: DoubleArray) : FrameTransform
+        data class Homography(val matrix3x3: DoubleArray) : FrameTransform
+    }
 
     override suspend fun process(
         frames: List<StackFrame>,
@@ -55,198 +69,271 @@ class FocusStackProcessor(
             requestedPreset = config.outputSettings.maxResolution
         )
 
+        val (targetWidth, targetHeight) = bitmapLoader.readOrientedDimensions(
+            uri = frames[refIndex].uri,
+            maxEdgePx = budget.effectiveMaxEdgePx
+        )
+
         onProgress(
             StackProgress(
                 currentStep = 1,
                 totalSteps = totalSteps,
                 fraction = 0.04f,
-                message = "Loading reference frame #${refIndex + 1}..."
+                message = "Analyzing reference frame #${refIndex + 1}..."
             )
         )
 
-        val alignedColorMats = ArrayList<Mat>(frameCount)
-        val previewBitmaps = ArrayList<Bitmap>(frameCount)
-        val sharpnessMaps = ArrayList<Mat>(frameCount)
-
-        var refGray: Mat? = null
-        var refKeypoints: MatOfKeyPoint? = null
-        var refDescriptors: Mat? = null
+        val transforms = Array<FrameTransform>(frameCount) { FrameTransform.Identity }
         var alignedCount = 1
-        var eccFallbackCount = 0
+        var eccSuccessCount = 0
+        var orbFallbackCount = 0
+
+        // Pass 1: 1024px Grayscale Proxy Alignment (Zero full-res Mat retention)
+        var refGray1024: Mat? = null
+        var refKeypoints1024: MatOfKeyPoint? = null
+        var refDescriptors1024: Mat? = null
 
         try {
-            // 1. Load reference (middle) frame first to lock canonical target dimensions
-            val refBitmap = bitmapLoader.loadNormalizedBitmap(
-                uri = frames[refIndex].uri,
-                maxEdgePx = budget.effectiveMaxEdgePx
-            )
-            val targetWidth = refBitmap.width
-            val targetHeight = refBitmap.height
-
-            val refBgr = bitmapToBgrMat(refBitmap)
-            val refPreview = bitmapLoader.createPreviewCopy(refBitmap)
-            refBitmap.recycle()
-
-            val preallocatedMats = Array<Mat?>(frameCount) { null }
-            val preallocatedPreviews = Array<Bitmap?>(frameCount) { null }
-            preallocatedMats[refIndex] = refBgr
-            preallocatedPreviews[refIndex] = refPreview
-
             if (config.alignmentMode == AlignmentMode.AUTO_HOMOGRAPHY) {
-                refGray = Mat()
-                Imgproc.cvtColor(refBgr, refGray, Imgproc.COLOR_BGR2GRAY)
-                refKeypoints = MatOfKeyPoint()
-                refDescriptors = Mat()
-                val orb = ORB.create(2000)
-                orb.detectAndCompute(refGray, Mat(), refKeypoints, refDescriptors)
-            }
+                val refProxyBmp = bitmapLoader.loadNormalizedBitmap(
+                    uri = frames[refIndex].uri,
+                    maxEdgePx = ALIGN_PROXY_MAX_EDGE_PX
+                )
+                val refProxyBgr = bitmapToBgrMat(refProxyBmp)
+                refProxyBmp.recycle()
 
-            // 2. Load & align each remaining frame sequentially
-            var processedAlignment = 0
-            for (i in 0 until frameCount) {
-                coroutineContext.ensureActive()
-                if (i == refIndex) continue
+                refGray1024 = Mat()
+                Imgproc.cvtColor(refProxyBgr, refGray1024, Imgproc.COLOR_BGR2GRAY)
+                refProxyBgr.release()
 
-                processedAlignment++
-                val stepFraction = 0.06f + 0.38f * (processedAlignment.toFloat() / (frameCount - 1).coerceAtLeast(1))
-                val stepLabel = if (config.alignmentMode == AlignmentMode.AUTO_HOMOGRAPHY) {
-                    "Aligning frame ${i + 1} of $frameCount..."
-                } else {
-                    "Decoding frame ${i + 1} of $frameCount..."
+                val proxyW = refGray1024.cols()
+                val proxyH = refGray1024.rows()
+                val scaleX = proxyW.toDouble() / targetWidth.toDouble()
+                val scaleY = proxyH.toDouble() / targetHeight.toDouble()
+
+                var alignedDone = 0
+                for (i in 0 until frameCount) {
+                    coroutineContext.ensureActive()
+                    if (i == refIndex) continue
+
+                    alignedDone++
+                    val frac = 0.06f + 0.30f * (alignedDone.toFloat() / (frameCount - 1).coerceAtLeast(1))
+                    onProgress(
+                        StackProgress(
+                            currentStep = 1,
+                            totalSteps = totalSteps,
+                            fraction = frac,
+                            message = "ECC 1024px aligning frame ${i + 1} of $frameCount..."
+                        )
+                    )
+
+                    val srcProxyBmp = bitmapLoader.loadNormalizedBitmap(
+                        uri = frames[i].uri,
+                        targetWidth = proxyW,
+                        targetHeight = proxyH
+                    )
+                    val srcProxyBgr = bitmapToBgrMat(srcProxyBmp)
+                    srcProxyBmp.recycle()
+
+                    val srcGray1024 = Mat()
+                    Imgproc.cvtColor(srcProxyBgr, srcGray1024, Imgproc.COLOR_BGR2GRAY)
+                    srcProxyBgr.release()
+
+                    try {
+                        // Stage 1: ECC MOTION_AFFINE on 1024px proxy
+                        val eccAffine = tryEccAffineOnProxy(
+                            srcGray = srcGray1024,
+                            refGray = refGray1024,
+                            scaleX = scaleX,
+                            scaleY = scaleY,
+                            fullWidth = targetWidth,
+                            fullHeight = targetHeight
+                        )
+                        if (eccAffine != null) {
+                            transforms[i] = eccAffine
+                            alignedCount++
+                            eccSuccessCount++
+                        } else {
+                            // Stage 2: ORB + RANSAC Homography fallback on 1024px proxy
+                            if (refKeypoints1024 == null || refDescriptors1024 == null) {
+                                val kp = MatOfKeyPoint()
+                                val desc = Mat()
+                                ORB.create(2000).detectAndCompute(refGray1024, Mat(), kp, desc)
+                                refKeypoints1024 = kp
+                                refDescriptors1024 = desc
+                            }
+                            val orbHomography = tryOrbHomographyOnProxy(
+                                srcGray = srcGray1024,
+                                refKeypoints = refKeypoints1024,
+                                refDescriptors = refDescriptors1024,
+                                scaleX = scaleX,
+                                scaleY = scaleY,
+                                fullWidth = targetWidth,
+                                fullHeight = targetHeight
+                            )
+                            if (orbHomography != null) {
+                                transforms[i] = orbHomography
+                                alignedCount++
+                                orbFallbackCount++
+                            } else {
+                                transforms[i] = FrameTransform.Identity
+                            }
+                        }
+                    } finally {
+                        srcGray1024.release()
+                    }
                 }
+            }
+        } finally {
+            refGray1024?.release()
+            refGray1024 = null
+            refKeypoints1024?.release()
+            refKeypoints1024 = null
+            refDescriptors1024?.release()
+            refDescriptors1024 = null
+        }
+
+        // Compute maximum valid overlapping bounding box across all warped frames
+        val cropRect = if (config.autoCropBorders && config.alignmentMode == AlignmentMode.AUTO_HOMOGRAPHY) {
+            computeValidOverlapRect(transforms, targetWidth, targetHeight)
+        } else {
+            Rect(0, 0, targetWidth, targetHeight)
+        }
+        val wasAutoCropped = cropRect.width < targetWidth || cropRect.height < targetHeight
+        val outWidth = cropRect.width
+        val outHeight = cropRect.height
+
+        onProgress(
+            StackProgress(
+                currentStep = 2,
+                totalSteps = totalSteps,
+                fraction = 0.38f,
+                message = if (wasAutoCropped) {
+                    "Auto-cropped to ${outWidth}×${outHeight}; streaming frames..."
+                } else {
+                    "Streaming $frameCount frames through pyramid accumulator..."
+                }
+            )
+        )
+
+        // Pass 2: Full-Res Streaming Alignment + Laplacian Pyramid Accumulation
+        val runDir = bitmapLoader.getRetouchRunDir(UUID.randomUUID().toString())
+        val preallocatedPreviews = arrayOfNulls<Bitmap>(frameCount)
+        val preallocatedCachePaths = arrayOfNulls<String>(frameCount)
+
+        val pyramidLevels = computePyramidLevels(outWidth, outHeight)
+        val lapBlurKernel = (config.edgeSmoothingRadius.coerceIn(1, 15) * 2 + 1).toDouble()
+        val energyWindowKernel = ((config.edgeSmoothingRadius * 2 + 3).coerceAtLeast(5) or 1).toDouble()
+        val smoothDMapKernel = ((config.edgeSmoothingRadius * 4 + 3).coerceAtLeast(5) or 1).toDouble()
+        val pmaxMaskBlurKernel = (config.edgeSmoothingRadius.coerceAtLeast(1) * 2 + 1).toDouble()
+
+        val numeratorPyramid = ArrayList<Mat>(pyramidLevels)
+        val denominatorPyramid = ArrayList<Mat>(pyramidLevels)
+        var runningMaxSharpness: Mat? = null
+
+        // Process middle reference frame first so PMax flat regions anchor cleanly to reference
+        val processingOrder = listOf(refIndex) + (0 until frameCount).filter { it != refIndex }
+
+        try {
+            for ((stepIdx, frameIdx) in processingOrder.withIndex()) {
+                coroutineContext.ensureActive()
+
+                val frac = 0.40f + 0.50f * ((stepIdx + 1).toFloat() / frameCount)
                 onProgress(
                     StackProgress(
-                        currentStep = 1,
-                        totalSteps = totalSteps,
-                        fraction = stepFraction,
-                        message = stepLabel
-                    )
-                )
-
-                val frameBitmap = bitmapLoader.loadNormalizedBitmap(
-                    uri = frames[i].uri,
-                    targetWidth = targetWidth,
-                    targetHeight = targetHeight
-                )
-                val frameBgr = bitmapToBgrMat(frameBitmap)
-                val framePreview = bitmapLoader.createPreviewCopy(frameBitmap)
-                frameBitmap.recycle()
-
-                if (config.alignmentMode == AlignmentMode.AUTO_HOMOGRAPHY && refGray != null) {
-                    val aligned = alignFrameToReference(
-                        srcBgr = frameBgr,
-                        refGray = refGray,
-                        refKeypoints = refKeypoints,
-                        refDescriptors = refDescriptors
-                    )
-                    frameBgr.release()
-                    preallocatedMats[i] = aligned.mat
-                    if (aligned.usedAlignment) alignedCount++
-                    if (aligned.usedEccFallback) eccFallbackCount++
-                } else {
-                    preallocatedMats[i] = frameBgr
-                    alignedCount++
-                }
-                preallocatedPreviews[i] = framePreview
-            }
-
-            for (i in 0 until frameCount) {
-                alignedColorMats.add(preallocatedMats[i]!!)
-                previewBitmaps.add(preallocatedPreviews[i]!!)
-            }
-            refGray?.release()
-            refGray = null
-            refKeypoints?.release()
-            refKeypoints = null
-            refDescriptors?.release()
-            refDescriptors = null
-
-            // 3. Compute focus / sharpness weights via Gaussian + Laplacian + local energy windowing
-            val lapBlurKernel = (config.edgeSmoothingRadius.coerceIn(1, 15) * 2 + 1).toDouble()
-            val energyWindowKernel = ((config.edgeSmoothingRadius * 2 + 3).coerceAtLeast(5) or 1).toDouble()
-
-            for (i in 0 until frameCount) {
-                coroutineContext.ensureActive()
-                val frac = 0.45f + 0.15f * ((i + 1).toFloat() / frameCount)
-                onProgress(
-                    StackProgress(
-                        currentStep = 2,
+                        currentStep = if (stepIdx < frameCount / 2) 2 else 3,
                         totalSteps = totalSteps,
                         fraction = frac,
-                        message = "Measuring focus sharpness (${i + 1}/$frameCount)..."
+                        message = "Aligning & fusing frame ${stepIdx + 1} of $frameCount..."
                     )
                 )
-                sharpnessMaps.add(
-                    computeSharpnessEnergyMap(
-                        bgrMat = alignedColorMats[i],
+
+                var rawBgr: Mat? = null
+                var alignedBgr: Mat? = null
+                var croppedBgr: Mat? = null
+                var sharpnessMap: Mat? = null
+                var imgLap: List<Mat>? = null
+
+                try {
+                    val frameBitmap = bitmapLoader.loadNormalizedBitmap(
+                        uri = frames[frameIdx].uri,
+                        targetWidth = targetWidth,
+                        targetHeight = targetHeight
+                    )
+                    rawBgr = bitmapToBgrMat(frameBitmap)
+                    frameBitmap.recycle()
+
+                    alignedBgr = warpFullFrame(rawBgr, transforms[frameIdx], targetWidth, targetHeight)
+                    if (alignedBgr !== rawBgr) {
+                        rawBgr.release()
+                        rawBgr = null
+                    }
+
+                    croppedBgr = if (wasAutoCropped) {
+                        val sub = Mat(alignedBgr, cropRect)
+                        val cloned = sub.clone()
+                        sub.release()
+                        alignedBgr.release()
+                        alignedBgr = null
+                        cloned
+                    } else {
+                        val ref = alignedBgr
+                        alignedBgr = null
+                        ref
+                    }
+
+                    // Persist aligned+cropped frame to disk cache for zero-RAM full-res retouching
+                    val cacheFile = File(runDir, "aligned_$frameIdx.jpg")
+                    saveMatAsJpeg(croppedBgr, cacheFile)
+                    preallocatedCachePaths[frameIdx] = cacheFile.absolutePath
+                    preallocatedPreviews[frameIdx] = createPreviewFromBgrMat(croppedBgr, PREVIEW_MAX_EDGE_PX)
+
+                    // Compute sharpness energy and Laplacian pyramid for this single frame
+                    sharpnessMap = computeSharpnessEnergyMap(
+                        bgrMat = croppedBgr,
                         preBlurKernel = lapBlurKernel,
                         energyWindowKernel = energyWindowKernel
                     )
-                )
-            }
+                    imgLap = buildLaplacianPyramidFromBgr(croppedBgr, pyramidLevels)
 
-            // 4. Build multi-scale Laplacian pyramids & fuse sharpest regions
-            onProgress(
-                StackProgress(
-                    currentStep = 3,
-                    totalSteps = totalSteps,
-                    fraction = 0.63f,
-                    message = "Building Laplacian pyramids..."
-                )
-            )
+                    // Release the full-res BGR Mat immediately before accumulating
+                    croppedBgr.release()
+                    croppedBgr = null
 
-            val pyramidLevels = computePyramidLevels(targetWidth, targetHeight)
-            val fusedLaplacianPyramid = ArrayList<Mat>(pyramidLevels)
-
-            when (config.blendAlgorithm) {
-                BlendAlgorithm.PYRAMID_PMAX -> {
-                    blendPyramidPMax(
-                        colorMats = alignedColorMats,
-                        sharpnessMaps = sharpnessMaps,
-                        pyramidLevels = pyramidLevels,
-                        smoothingRadius = config.edgeSmoothingRadius,
-                        fusedPyramidOut = fusedLaplacianPyramid,
-                        onFrameBlended = { idx ->
-                            val frac = 0.65f + 0.25f * ((idx + 1).toFloat() / frameCount)
-                            onProgress(
-                                StackProgress(
-                                    currentStep = 3,
-                                    totalSteps = totalSteps,
-                                    fraction = frac,
-                                    message = "Fusing sharpest regions (${idx + 1}/$frameCount)..."
-                                )
+                    when (config.blendAlgorithm) {
+                        BlendAlgorithm.SMOOTH_DMAP -> {
+                            accumulateSmoothDMapFrame(
+                                imgLap = imgLap,
+                                sharpnessMap = sharpnessMap,
+                                pyramidLevels = pyramidLevels,
+                                smoothKernel = smoothDMapKernel,
+                                numeratorPyramid = numeratorPyramid,
+                                denominatorPyramid = denominatorPyramid
                             )
                         }
-                    )
-                }
 
-                BlendAlgorithm.SMOOTH_DMAP -> {
-                    blendSmoothDepthMap(
-                        colorMats = alignedColorMats,
-                        sharpnessMaps = sharpnessMaps,
-                        pyramidLevels = pyramidLevels,
-                        smoothingRadius = config.edgeSmoothingRadius,
-                        fusedPyramidOut = fusedLaplacianPyramid,
-                        onFrameBlended = { idx ->
-                            val frac = 0.65f + 0.25f * ((idx + 1).toFloat() / frameCount)
-                            onProgress(
-                                StackProgress(
-                                    currentStep = 3,
-                                    totalSteps = totalSteps,
-                                    fraction = frac,
-                                    message = "Blending smooth depth map (${idx + 1}/$frameCount)..."
-                                )
+                        BlendAlgorithm.PYRAMID_PMAX -> {
+                            runningMaxSharpness = accumulatePMaxFrame(
+                                isFirstFrame = (stepIdx == 0),
+                                imgLap = imgLap,
+                                sharpnessMap = sharpnessMap,
+                                runningMaxSharpness = runningMaxSharpness,
+                                pyramidLevels = pyramidLevels,
+                                maskBlurKernel = pmaxMaskBlurKernel,
+                                fusedPyramid = numeratorPyramid
                             )
                         }
-                    )
+                    }
+                } finally {
+                    rawBgr?.release()
+                    alignedBgr?.release()
+                    croppedBgr?.release()
+                    if (config.blendAlgorithm == BlendAlgorithm.SMOOTH_DMAP || stepIdx > 0) {
+                        sharpnessMap?.release()
+                    }
+                    imgLap?.forEach { it.release() }
                 }
             }
-
-            // Release sharpness maps and aligned source Mats before reconstruction
-            sharpnessMaps.forEach { it.release() }
-            sharpnessMaps.clear()
-            alignedColorMats.forEach { it.release() }
-            alignedColorMats.clear()
 
             coroutineContext.ensureActive()
             onProgress(
@@ -258,9 +345,25 @@ class FocusStackProcessor(
                 )
             )
 
-            val reconstructedFloat = reconstructLaplacianPyramid(fusedLaplacianPyramid)
-            fusedLaplacianPyramid.forEach { it.release() }
-            fusedLaplacianPyramid.clear()
+            // Normalize numerator / denominator buffers for Smooth DMap
+            if (config.blendAlgorithm == BlendAlgorithm.SMOOTH_DMAP) {
+                for (level in 0 until pyramidLevels) {
+                    val denom3ch = Mat()
+                    Imgproc.cvtColor(denominatorPyramid[level], denom3ch, Imgproc.COLOR_GRAY2BGR)
+                    Core.max(denom3ch, Scalar(1e-6, 1e-6, 1e-6), denom3ch)
+                    Core.divide(numeratorPyramid[level], denom3ch, numeratorPyramid[level])
+                    denom3ch.release()
+                }
+            }
+
+            denominatorPyramid.forEach { it.release() }
+            denominatorPyramid.clear()
+            runningMaxSharpness?.release()
+            runningMaxSharpness = null
+
+            val reconstructedFloat = reconstructLaplacianPyramid(numeratorPyramid)
+            numeratorPyramid.forEach { it.release() }
+            numeratorPyramid.clear()
 
             val outputBitmap = floatBgrMatToBitmap(reconstructedFloat)
             reconstructedFloat.release()
@@ -268,8 +371,8 @@ class FocusStackProcessor(
             val elapsedMs = System.currentTimeMillis() - startTimeMs
             val alignmentNote = when {
                 config.alignmentMode == AlignmentMode.NONE -> "Tripod mode (no warping)"
-                eccFallbackCount > 0 -> "ORB + RANSAC ($eccFallbackCount ECC affine)"
-                else -> "ORB + RANSAC homography"
+                orbFallbackCount > 0 -> "ECC affine ($eccSuccessCount) + ORB ($orbFallbackCount)"
+                else -> "1024px ECC affine"
             }
 
             onProgress(
@@ -283,173 +386,344 @@ class FocusStackProcessor(
 
             return StackResult(
                 outputBitmap = outputBitmap,
-                sourcePreviewBitmaps = previewBitmaps,
+                sourcePreviewBitmaps = preallocatedPreviews.map { it!! },
+                alignedSourceCachePaths = preallocatedCachePaths.map { it!! },
+                referenceFrameUri = frames[refIndex].uri,
                 frameNames = frames.map { it.displayName },
                 defaultComparisonIndex = 0,
                 alignedFramesCount = alignedCount,
                 processingTimeMs = elapsedMs,
                 usedProxyMode = budget.usedProxyMode,
                 proxyReason = budget.reason,
-                outputWidth = targetWidth,
-                outputHeight = targetHeight,
-                alignmentNote = alignmentNote
+                outputWidth = outputBitmap.width,
+                outputHeight = outputBitmap.height,
+                alignmentNote = alignmentNote,
+                wasAutoCropped = wasAutoCropped,
+                resolutionPreset = config.outputSettings.maxResolution
             )
         } finally {
-            refGray?.release()
-            refKeypoints?.release()
-            refDescriptors?.release()
-            sharpnessMaps.forEach { it.release() }
-            alignedColorMats.forEach { it.release() }
+            runningMaxSharpness?.release()
+            numeratorPyramid.forEach { it.release() }
+            denominatorPyramid.forEach { it.release() }
         }
     }
 
-    private data class AlignmentOutcome(
-        val mat: Mat,
-        val usedAlignment: Boolean,
-        val usedEccFallback: Boolean
-    )
-
-    private fun alignFrameToReference(
-        srcBgr: Mat,
+    private fun tryEccAffineOnProxy(
+        srcGray: Mat,
         refGray: Mat,
+        scaleX: Double,
+        scaleY: Double,
+        fullWidth: Int,
+        fullHeight: Int
+    ): FrameTransform.Affine? {
+        val refBlur = Mat()
+        val srcBlur = Mat()
+        val ref32 = Mat()
+        val src32 = Mat()
+        val warpInvProxy = Mat.eye(2, 3, CvType.CV_32F)
+        val warpInvFull = Mat(2, 3, CvType.CV_64F)
+        val forwardAffineFull = Mat()
+
+        return try {
+            Imgproc.GaussianBlur(refGray, refBlur, Size(3.0, 3.0), 0.0)
+            Imgproc.GaussianBlur(srcGray, srcBlur, Size(3.0, 3.0), 0.0)
+            refBlur.convertTo(ref32, CvType.CV_32F, 1.0 / 255.0)
+            srcBlur.convertTo(src32, CvType.CV_32F, 1.0 / 255.0)
+
+            val criteria = TermCriteria(TermCriteria.COUNT or TermCriteria.EPS, 80, 1e-4)
+            Video.findTransformECC(ref32, src32, warpInvProxy, Video.MOTION_AFFINE, criteria)
+
+            // warpInvProxy maps ref_proxy -> src_proxy.
+            // Scale to full resolution: W_inv_full = S^-1 * W_inv_proxy * S
+            val a = warpInvProxy.get(0, 0)[0]
+            val b = warpInvProxy.get(0, 1)[0] * (scaleY / scaleX)
+            val tx = warpInvProxy.get(0, 2)[0] / scaleX
+            val c = warpInvProxy.get(1, 0)[0] * (scaleX / scaleY)
+            val d = warpInvProxy.get(1, 1)[0]
+            val ty = warpInvProxy.get(1, 2)[0] / scaleY
+
+            warpInvFull.put(0, 0, a, b, tx, c, d, ty)
+
+            // Invert so forwardAffineFull maps src_full -> ref_full directly
+            Imgproc.invertAffineTransform(warpInvFull, forwardAffineFull)
+
+            val m = DoubleArray(6)
+            forwardAffineFull.get(0, 0, m)
+            if (!isValidAffine(m, fullWidth, fullHeight)) {
+                null
+            } else {
+                FrameTransform.Affine(m)
+            }
+        } catch (_: Exception) {
+            null
+        } finally {
+            refBlur.release()
+            srcBlur.release()
+            ref32.release()
+            src32.release()
+            warpInvProxy.release()
+            warpInvFull.release()
+            forwardAffineFull.release()
+        }
+    }
+
+    private fun tryOrbHomographyOnProxy(
+        srcGray: Mat,
         refKeypoints: MatOfKeyPoint?,
-        refDescriptors: Mat?
-    ): AlignmentOutcome {
-        val srcGray = Mat()
+        refDescriptors: Mat?,
+        scaleX: Double,
+        scaleY: Double,
+        fullWidth: Int,
+        fullHeight: Int
+    ): FrameTransform.Homography? {
+        if (refKeypoints == null || refDescriptors == null || refDescriptors.empty()) return null
         val srcKeypoints = MatOfKeyPoint()
         val srcDescriptors = Mat()
-        try {
-            Imgproc.cvtColor(srcBgr, srcGray, Imgproc.COLOR_BGR2GRAY)
 
-            // Primary: ORB + BFMatcher (Lowe ratio test) + findHomography(RANSAC)
-            if (refKeypoints != null && refDescriptors != null && !refDescriptors.empty()) {
-                val orb = ORB.create(2000)
-                orb.detectAndCompute(srcGray, Mat(), srcKeypoints, srcDescriptors)
+        return try {
+            ORB.create(2000).detectAndCompute(srcGray, Mat(), srcKeypoints, srcDescriptors)
+            if (srcDescriptors.empty() || srcDescriptors.rows() < 12) return null
 
-                if (!srcDescriptors.empty() && srcDescriptors.rows() >= 12) {
-                    val matcher = BFMatcher.create(Core.NORM_HAMMING, false)
-                    val knnMatches = ArrayList<MatOfDMatch>()
-                    matcher.knnMatch(srcDescriptors, refDescriptors, knnMatches, 2)
+            val matcher = BFMatcher.create(Core.NORM_HAMMING, false)
+            val knnMatches = ArrayList<MatOfDMatch>()
+            matcher.knnMatch(srcDescriptors, refDescriptors, knnMatches, 2)
 
-                    val goodMatches = ArrayList<DMatch>()
-                    for (matOfDMatch in knnMatches) {
-                        val arr = matOfDMatch.toArray()
-                        if (arr.size >= 2 && arr[0].distance < 0.75f * arr[1].distance) {
-                            goodMatches.add(arr[0])
-                        }
-                        matOfDMatch.release()
-                    }
-
-                    if (goodMatches.size >= 12) {
-                        val srcPtsList = ArrayList<Point>(goodMatches.size)
-                        val dstPtsList = ArrayList<Point>(goodMatches.size)
-                        val srcKpArray = srcKeypoints.toArray()
-                        val refKpArray = refKeypoints.toArray()
-                        for (m in goodMatches) {
-                            srcPtsList.add(srcKpArray[m.queryIdx].pt)
-                            dstPtsList.add(refKpArray[m.trainIdx].pt)
-                        }
-
-                        val srcPts = MatOfPoint2f(*srcPtsList.toTypedArray())
-                        val dstPts = MatOfPoint2f(*dstPtsList.toTypedArray())
-                        val homography = Calib3d.findHomography(srcPts, dstPts, Calib3d.RANSAC, 4.0)
-                        srcPts.release()
-                        dstPts.release()
-
-                        if (!homography.empty() && isValidHomography(homography, srcBgr.cols(), srcBgr.rows())) {
-                            val warped = Mat()
-                            Imgproc.warpPerspective(
-                                srcBgr,
-                                warped,
-                                homography,
-                                srcBgr.size(),
-                                Imgproc.INTER_LINEAR,
-                                Core.BORDER_REPLICATE
-                            )
-                            homography.release()
-                            return AlignmentOutcome(warped, usedAlignment = true, usedEccFallback = false)
-                        }
-                        homography.release()
-                    }
+            val goodMatches = ArrayList<DMatch>()
+            for (matOfDMatch in knnMatches) {
+                val arr = matOfDMatch.toArray()
+                if (arr.size >= 2 && arr[0].distance < 0.75f * arr[1].distance) {
+                    goodMatches.add(arr[0])
                 }
+                matOfDMatch.release()
             }
 
-            // Fallback: ECC Affine transform on downscaled proxy for speed & robustness
-            val eccWarped = tryEccAffineAlignment(srcBgr, srcGray, refGray)
-            if (eccWarped != null) {
-                return AlignmentOutcome(eccWarped, usedAlignment = true, usedEccFallback = true)
+            if (goodMatches.size < 12) return null
+
+            val srcKpArray = srcKeypoints.toArray()
+            val refKpArray = refKeypoints.toArray()
+            val srcPtsList = ArrayList<Point>(goodMatches.size)
+            val dstPtsList = ArrayList<Point>(goodMatches.size)
+            for (m in goodMatches) {
+                srcPtsList.add(srcKpArray[m.queryIdx].pt)
+                dstPtsList.add(refKpArray[m.trainIdx].pt)
             }
 
-            // Last resort: keep original unwarped frame rather than failing the stack
-            return AlignmentOutcome(srcBgr.clone(), usedAlignment = false, usedEccFallback = false)
+            val srcPts = MatOfPoint2f(*srcPtsList.toTypedArray())
+            val dstPts = MatOfPoint2f(*dstPtsList.toTypedArray())
+            val homographyProxy = Calib3d.findHomography(srcPts, dstPts, Calib3d.RANSAC, 4.0)
+            srcPts.release()
+            dstPts.release()
+
+            if (homographyProxy.empty()) {
+                homographyProxy.release()
+                return null
+            }
+
+            val hp = DoubleArray(9)
+            homographyProxy.get(0, 0, hp)
+            homographyProxy.release()
+
+            // Scale H_full = S^-1 * H_proxy * S
+            val h22 = if (abs(hp[8]) > 1e-9) hp[8] else 1.0
+            val hFull = doubleArrayOf(
+                hp[0] / h22,
+                (hp[1] * (scaleY / scaleX)) / h22,
+                (hp[2] / scaleX) / h22,
+                (hp[3] * (scaleX / scaleY)) / h22,
+                hp[4] / h22,
+                (hp[5] / scaleY) / h22,
+                (hp[6] * scaleX) / h22,
+                (hp[7] * scaleY) / h22,
+                1.0
+            )
+
+            if (!isValidHomography(hFull, fullWidth, fullHeight)) {
+                null
+            } else {
+                FrameTransform.Homography(hFull)
+            }
+        } catch (_: Exception) {
+            null
         } finally {
-            srcGray.release()
             srcKeypoints.release()
             srcDescriptors.release()
         }
     }
 
-    private fun tryEccAffineAlignment(srcBgr: Mat, srcGray: Mat, refGray: Mat): Mat? {
-        val maxEccDim = 512.0
-        val scale = min(1.0, maxEccDim / maxOf(refGray.cols(), refGray.rows()).toDouble())
-        val smallRef = Mat()
-        val smallSrc = Mat()
-        val smallRef32 = Mat()
-        val smallSrc32 = Mat()
-        val warpMatrix = Mat.eye(2, 3, CvType.CV_32F)
+    private fun isValidAffine(m: DoubleArray, width: Int, height: Int): Boolean {
+        if (m.size < 6 || m.any { !it.isFinite() }) return false
+        val det = m[0] * m[4] - m[1] * m[3]
+        if (det < 0.40 || det > 2.40) return false
+        if (abs(m[2]) > width * 0.35 || abs(m[5]) > height * 0.35) return false
+        return true
+    }
 
-        return try {
-            val smallSize = Size(
-                (refGray.cols() * scale).coerceAtLeast(32.0),
-                (refGray.rows() * scale).coerceAtLeast(32.0)
-            )
-            Imgproc.resize(refGray, smallRef, smallSize, 0.0, 0.0, Imgproc.INTER_AREA)
-            Imgproc.resize(srcGray, smallSrc, smallSize, 0.0, 0.0, Imgproc.INTER_AREA)
-            smallRef.convertTo(smallRef32, CvType.CV_32F, 1.0 / 255.0)
-            smallSrc.convertTo(smallSrc32, CvType.CV_32F, 1.0 / 255.0)
+    private fun isValidHomography(h: DoubleArray, width: Int, height: Int): Boolean {
+        if (h.size < 9 || h.any { !it.isFinite() }) return false
+        val det = h[0] * h[4] - h[1] * h[3]
+        if (det < 0.35 || det > 2.8) return false
+        if (abs(h[2]) > width * 0.35 || abs(h[5]) > height * 0.35) return false
+        return true
+    }
 
-            val criteria = TermCriteria(TermCriteria.COUNT or TermCriteria.EPS, 50, 1e-4)
-            Video.findTransformECC(smallRef32, smallSrc32, warpMatrix, Video.MOTION_AFFINE, criteria)
+    private fun computeValidOverlapRect(
+        transforms: Array<FrameTransform>,
+        width: Int,
+        height: Int
+    ): Rect {
+        var minX = 0.0
+        var minY = 0.0
+        var maxX = width.toDouble()
+        var maxY = height.toDouble()
+        var hadWarp = false
 
-            // Scale translation components back to full resolution
-            val tx = warpMatrix.get(0, 2)[0] / scale
-            val ty = warpMatrix.get(1, 2)[0] / scale
-            warpMatrix.put(0, 2, tx)
-            warpMatrix.put(1, 2, ty)
+        val w = width.toDouble()
+        val h = height.toDouble()
 
-            val warped = Mat()
-            Imgproc.warpAffine(
-                srcBgr,
-                warped,
-                warpMatrix,
-                srcBgr.size(),
-                Imgproc.INTER_LINEAR,
-                Core.BORDER_REPLICATE
-            )
-            warped
-        } catch (_: Exception) {
-            null
-        } finally {
-            smallRef.release()
-            smallSrc.release()
-            smallRef32.release()
-            smallSrc32.release()
-            warpMatrix.release()
+        for (t in transforms) {
+            if (t is FrameTransform.Identity) continue
+            hadWarp = true
+            val c00 = transformPoint(t, 0.0, 0.0)
+            val c10 = transformPoint(t, w, 0.0)
+            val c11 = transformPoint(t, w, h)
+            val c01 = transformPoint(t, 0.0, h)
+
+            val frameLeft = max(c00.first, c01.first)
+            val frameRight = min(c10.first, c11.first)
+            val frameTop = max(c00.second, c10.second)
+            val frameBottom = min(c01.second, c11.second)
+
+            minX = max(minX, frameLeft)
+            maxX = min(maxX, frameRight)
+            minY = max(minY, frameTop)
+            maxY = min(maxY, frameBottom)
+        }
+
+        if (!hadWarp) return Rect(0, 0, width, height)
+
+        // Add 2px safety margin on cropped edges to remove any bilinear edge fringe
+        val insetLeft = if (minX > 0.5) ceil(minX).toInt() + 2 else 0
+        val insetTop = if (minY > 0.5) ceil(minY).toInt() + 2 else 0
+        val insetRight = if (maxX < w - 0.5) floor(maxX).toInt() - 2 else width
+        val insetBottom = if (maxY < h - 0.5) floor(maxY).toInt() - 2 else height
+
+        val x = insetLeft.coerceIn(0, width - 1)
+        val y = insetTop.coerceIn(0, height - 1)
+        val cropW = (insetRight - x).coerceAtLeast(0)
+        val cropH = (insetBottom - y).coerceAtLeast(0)
+
+        // Guard against degenerate crop boxes
+        if (cropW < (width * 0.45).toInt() || cropH < (height * 0.45).toInt() || cropW < 64 || cropH < 64) {
+            return Rect(0, 0, width, height)
+        }
+        return Rect(x, y, cropW, cropH)
+    }
+
+    private fun transformPoint(t: FrameTransform, x: Double, y: Double): Pair<Double, Double> {
+        return when (t) {
+            FrameTransform.Identity -> x to y
+            is FrameTransform.Affine -> {
+                val m = t.matrix2x3
+                (m[0] * x + m[1] * y + m[2]) to (m[3] * x + m[4] * y + m[5])
+            }
+            is FrameTransform.Homography -> {
+                val h = t.matrix3x3
+                val denom = h[6] * x + h[7] * y + h[8]
+                if (abs(denom) < 1e-9) x to y
+                else ((h[0] * x + h[1] * y + h[2]) / denom) to ((h[3] * x + h[4] * y + h[5]) / denom)
+            }
         }
     }
 
-    private fun isValidHomography(h: Mat, width: Int, height: Int): Boolean {
-        if (h.rows() != 3 || h.cols() != 3) return false
-        val a = h.get(0, 0)[0]
-        val b = h.get(0, 1)[0]
-        val tx = h.get(0, 2)[0]
-        val c = h.get(1, 0)[0]
-        val d = h.get(1, 1)[0]
-        val ty = h.get(1, 2)[0]
-        val det = a * d - b * c
-        if (det < 0.35 || det > 2.8) return false
-        if (abs(tx) > width * 0.35 || abs(ty) > height * 0.35) return false
-        return true
+    private fun warpFullFrame(
+        srcBgr: Mat,
+        transform: FrameTransform,
+        targetWidth: Int,
+        targetHeight: Int
+    ): Mat {
+        return when (transform) {
+            FrameTransform.Identity -> srcBgr
+            is FrameTransform.Affine -> {
+                val mat = Mat(2, 3, CvType.CV_64F)
+                mat.put(0, 0, *transform.matrix2x3)
+                val warped = Mat()
+                Imgproc.warpAffine(
+                    srcBgr,
+                    warped,
+                    mat,
+                    Size(targetWidth.toDouble(), targetHeight.toDouble()),
+                    Imgproc.INTER_LINEAR,
+                    Core.BORDER_REPLICATE
+                )
+                mat.release()
+                warped
+            }
+            is FrameTransform.Homography -> {
+                val mat = Mat(3, 3, CvType.CV_64F)
+                mat.put(0, 0, *transform.matrix3x3)
+                val warped = Mat()
+                Imgproc.warpPerspective(
+                    srcBgr,
+                    warped,
+                    mat,
+                    Size(targetWidth.toDouble(), targetHeight.toDouble()),
+                    Imgproc.INTER_LINEAR,
+                    Core.BORDER_REPLICATE
+                )
+                mat.release()
+                warped
+            }
+        }
+    }
+
+    private fun saveMatAsJpeg(bgrMat: Mat, file: File) {
+        val params = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, 95)
+        try {
+            val ok = Imgcodecs.imwrite(file.absolutePath, bgrMat, params)
+            if (!ok) {
+                val rgba = Mat()
+                Imgproc.cvtColor(bgrMat, rgba, Imgproc.COLOR_BGR2RGBA)
+                val bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
+                Utils.matToBitmap(rgba, bmp)
+                rgba.release()
+                file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 95, it) }
+                bmp.recycle()
+            }
+        } finally {
+            params.release()
+        }
+    }
+
+    private fun createPreviewFromBgrMat(bgrMat: Mat, maxEdgePx: Int): Bitmap {
+        val w = bgrMat.cols()
+        val h = bgrMat.rows()
+        val maxDim = max(w, h)
+        val resizedBgr = if (maxDim > maxEdgePx) {
+            val scale = maxEdgePx.toDouble() / maxDim.toDouble()
+            val dst = Mat()
+            Imgproc.resize(
+                bgrMat,
+                dst,
+                Size((w * scale).coerceAtLeast(1.0), (h * scale).coerceAtLeast(1.0)),
+                0.0,
+                0.0,
+                Imgproc.INTER_AREA
+            )
+            dst
+        } else {
+            bgrMat
+        }
+
+        val rgba = Mat()
+        return try {
+            Imgproc.cvtColor(resizedBgr, rgba, Imgproc.COLOR_BGR2RGBA)
+            val bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
+            Utils.matToBitmap(rgba, bmp)
+            bmp
+        } finally {
+            rgba.release()
+            if (resizedBgr !== bgrMat) resizedBgr.release()
+        }
     }
 
     private fun computeSharpnessEnergyMap(
@@ -478,152 +752,127 @@ class FocusStackProcessor(
         }
     }
 
-    private suspend fun blendPyramidPMax(
-        colorMats: List<Mat>,
-        sharpnessMaps: List<Mat>,
+    private fun accumulateSmoothDMapFrame(
+        imgLap: List<Mat>,
+        sharpnessMap: Mat,
         pyramidLevels: Int,
-        smoothingRadius: Int,
-        fusedPyramidOut: MutableList<Mat>,
-        onFrameBlended: (Int) -> Unit
+        smoothKernel: Double,
+        numeratorPyramid: MutableList<Mat>,
+        denominatorPyramid: MutableList<Mat>
     ) {
-        val rows = sharpnessMaps[0].rows()
-        val cols = sharpnessMaps[0].cols()
-        val frameCount = colorMats.size
-
-        // Compute per-pixel maximum sharpness across all frames
-        val maxSharpness = sharpnessMaps[0].clone()
-        for (i in 1 until frameCount) {
-            Core.max(maxSharpness, sharpnessMaps[i], maxSharpness)
-        }
-
-        // Count how many frames tie at each pixel's max so weights sum to 1.0 everywhere
-        val tieCount = Mat.zeros(rows, cols, CvType.CV_32F)
-        val cmpMask = Mat()
-        val cmpFloat = Mat()
-        val eps = Mat(rows, cols, CvType.CV_32F, Scalar(1e-6))
-        val maxMinusEps = Mat()
-        Core.subtract(maxSharpness, eps, maxMinusEps)
-        eps.release()
-
-        for (i in 0 until frameCount) {
-            Core.compare(sharpnessMaps[i], maxMinusEps, cmpMask, Core.CMP_GE)
-            cmpMask.convertTo(cmpFloat, CvType.CV_32F, 1.0 / 255.0)
-            Core.add(tieCount, cmpFloat, tieCount)
-        }
-        Core.max(tieCount, Scalar(1.0), tieCount)
-
-        val maskBlurSize = (smoothingRadius.coerceAtLeast(1) * 2 + 1).toDouble()
-
+        val smoothed = Mat()
+        val weight = Mat()
         try {
-            for (i in 0 until frameCount) {
-                coroutineContext.ensureActive()
-                Core.compare(sharpnessMaps[i], maxMinusEps, cmpMask, Core.CMP_GE)
-                cmpMask.convertTo(cmpFloat, CvType.CV_32F, 1.0 / 255.0)
-                val normWeight = Mat()
-                Core.divide(cmpFloat, tieCount, normWeight)
-                if (smoothingRadius > 0) {
-                    Imgproc.GaussianBlur(normWeight, normWeight, Size(maskBlurSize, maskBlurSize), 0.0)
+            Imgproc.GaussianBlur(sharpnessMap, smoothed, Size(smoothKernel, smoothKernel), 0.0)
+            Core.multiply(smoothed, smoothed, weight)
+            Core.add(weight, Scalar(1e-6), weight)
+
+            val weightGauss = buildGaussianPyramid(weight, pyramidLevels)
+            val init = numeratorPyramid.isEmpty()
+            try {
+                for (level in 0 until pyramidLevels) {
+                    val weight3ch = Mat()
+                    Imgproc.cvtColor(weightGauss[level], weight3ch, Imgproc.COLOR_GRAY2BGR)
+                    val weighted = Mat()
+                    Core.multiply(imgLap[level], weight3ch, weighted)
+                    weight3ch.release()
+
+                    if (init) {
+                        numeratorPyramid.add(weighted)
+                        denominatorPyramid.add(weightGauss[level].clone())
+                    } else {
+                        Core.add(numeratorPyramid[level], weighted, numeratorPyramid[level])
+                        weighted.release()
+                        Core.add(denominatorPyramid[level], weightGauss[level], denominatorPyramid[level])
+                    }
                 }
-
-                accumulateFrameIntoPyramid(
-                    bgrMat = colorMats[i],
-                    weightMap = normWeight,
-                    pyramidLevels = pyramidLevels,
-                    fusedPyramid = fusedPyramidOut
-                )
-                normWeight.release()
-                onFrameBlended(i)
+            } finally {
+                weightGauss.forEach { it.release() }
             }
         } finally {
-            maxSharpness.release()
-            maxMinusEps.release()
-            tieCount.release()
-            cmpMask.release()
-            cmpFloat.release()
+            smoothed.release()
+            weight.release()
         }
     }
 
-    private suspend fun blendSmoothDepthMap(
-        colorMats: List<Mat>,
-        sharpnessMaps: List<Mat>,
+    private fun accumulatePMaxFrame(
+        isFirstFrame: Boolean,
+        imgLap: List<Mat>,
+        sharpnessMap: Mat,
+        runningMaxSharpness: Mat?,
         pyramidLevels: Int,
-        smoothingRadius: Int,
-        fusedPyramidOut: MutableList<Mat>,
-        onFrameBlended: (Int) -> Unit
-    ) {
-        val rows = sharpnessMaps[0].rows()
-        val cols = sharpnessMaps[0].cols()
-        val frameCount = colorMats.size
-        val smoothKernel = ((smoothingRadius * 4 + 3).coerceAtLeast(5) or 1).toDouble()
-
-        val poweredWeights = ArrayList<Mat>(frameCount)
-        val weightSum = Mat(rows, cols, CvType.CV_32F, Scalar(1e-6))
-
-        try {
-            for (i in 0 until frameCount) {
-                coroutineContext.ensureActive()
-                val smoothed = Mat()
-                Imgproc.GaussianBlur(sharpnessMaps[i], smoothed, Size(smoothKernel, smoothKernel), 0.0)
-                val squared = Mat()
-                Core.multiply(smoothed, smoothed, squared)
-                smoothed.release()
-                Core.add(weightSum, squared, weightSum)
-                poweredWeights.add(squared)
-            }
-
-            for (i in 0 until frameCount) {
-                coroutineContext.ensureActive()
-                val normWeight = Mat()
-                Core.divide(poweredWeights[i], weightSum, normWeight)
-                accumulateFrameIntoPyramid(
-                    bgrMat = colorMats[i],
-                    weightMap = normWeight,
-                    pyramidLevels = pyramidLevels,
-                    fusedPyramid = fusedPyramidOut
-                )
-                normWeight.release()
-                onFrameBlended(i)
-            }
-        } finally {
-            weightSum.release()
-            poweredWeights.forEach { it.release() }
-        }
-    }
-
-    private fun accumulateFrameIntoPyramid(
-        bgrMat: Mat,
-        weightMap: Mat,
-        pyramidLevels: Int,
+        maskBlurKernel: Double,
         fusedPyramid: MutableList<Mat>
-    ) {
+    ): Mat {
+        if (isFirstFrame || runningMaxSharpness == null) {
+            for (level in 0 until pyramidLevels) {
+                fusedPyramid.add(imgLap[level].clone())
+            }
+            return sharpnessMap
+        }
+
+        val cmpMask = Mat()
+        val alphaFloat = Mat()
+        try {
+            Core.compare(sharpnessMap, runningMaxSharpness, cmpMask, Core.CMP_GT)
+            cmpMask.convertTo(alphaFloat, CvType.CV_32F, 1.0 / 255.0)
+            Imgproc.GaussianBlur(alphaFloat, alphaFloat, Size(maskBlurKernel, maskBlurKernel), 0.0)
+            Core.max(runningMaxSharpness, sharpnessMap, runningMaxSharpness)
+
+            val alphaGauss = buildGaussianPyramid(alphaFloat, pyramidLevels)
+            try {
+                for (level in 0 until pyramidLevels) {
+                    val alpha3ch = Mat()
+                    Imgproc.cvtColor(alphaGauss[level], alpha3ch, Imgproc.COLOR_GRAY2BGR)
+                    val invAlpha3ch = Mat()
+                    Core.subtract(
+                        Mat.ones(alpha3ch.size(), alpha3ch.type()).also { oneMat ->
+                            // Use scalar subtraction cleanly below
+                            oneMat.release()
+                        },
+                        alpha3ch,
+                        invAlpha3ch
+                    )
+                    // Cleaner: Core.subtract(Scalar(1.0,1.0,1.0), alpha3ch) isn't overloaded with Scalar first in Java,
+                    // so use Core.addWeighted or scale+add: inv = alpha * (-1) + 1
+                    invAlpha3ch.release()
+
+                    val prevWeighted = Mat()
+                    val currWeighted = Mat()
+                    val invAlpha1ch = Mat()
+                    Core.multiply(alphaGauss[level], Scalar(-1.0), invAlpha1ch)
+                    Core.add(invAlpha1ch, Scalar(1.0), invAlpha1ch)
+                    val inv3ch = Mat()
+                    Imgproc.cvtColor(invAlpha1ch, inv3ch, Imgproc.COLOR_GRAY2BGR)
+                    invAlpha1ch.release()
+
+                    Core.multiply(fusedPyramid[level], inv3ch, prevWeighted)
+                    Core.multiply(imgLap[level], alpha3ch, currWeighted)
+                    Core.add(prevWeighted, currWeighted, fusedPyramid[level])
+
+                    inv3ch.release()
+                    alpha3ch.release()
+                    prevWeighted.release()
+                    currWeighted.release()
+                }
+            } finally {
+                alphaGauss.forEach { it.release() }
+            }
+        } finally {
+            cmpMask.release()
+            alphaFloat.release()
+        }
+        return runningMaxSharpness
+    }
+
+    private fun buildLaplacianPyramidFromBgr(bgrMat: Mat, levels: Int): List<Mat> {
         val floatBgr = Mat()
         bgrMat.convertTo(floatBgr, CvType.CV_32FC3, 1.0 / 255.0)
-
-        val imgGauss = buildGaussianPyramid(floatBgr, pyramidLevels)
+        val imgGauss = buildGaussianPyramid(floatBgr, levels)
         floatBgr.release()
         val imgLap = buildLaplacianPyramid(imgGauss)
         imgGauss.forEach { it.release() }
-
-        val weightGauss = buildGaussianPyramid(weightMap, pyramidLevels)
-
-        val initFused = fusedPyramid.isEmpty()
-        for (level in 0 until pyramidLevels) {
-            val weight3ch = Mat()
-            Imgproc.cvtColor(weightGauss[level], weight3ch, Imgproc.COLOR_GRAY2BGR)
-            val weighted = Mat()
-            Core.multiply(imgLap[level], weight3ch, weighted)
-            weight3ch.release()
-
-            if (initFused) {
-                fusedPyramid.add(weighted)
-            } else {
-                Core.add(fusedPyramid[level], weighted, fusedPyramid[level])
-                weighted.release()
-            }
-        }
-
-        imgLap.forEach { it.release() }
-        weightGauss.forEach { it.release() }
+        return imgLap
     }
 
     private fun buildGaussianPyramid(base: Mat, levels: Int): List<Mat> {
@@ -710,6 +959,9 @@ class FocusStackProcessor(
     }
 
     companion object {
+        private const val ALIGN_PROXY_MAX_EDGE_PX = 1024
+        private const val PREVIEW_MAX_EDGE_PX = 1080
+
         @Volatile
         private var openCvLoaded = false
 

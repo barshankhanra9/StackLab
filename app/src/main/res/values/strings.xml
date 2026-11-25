@@ -4,11 +4,14 @@
     <string name="cd_back">Navigate back</string>
     <string name="cd_focus_stack_hero">Macro photograph showing edge-to-edge focus depth</string>
     <string name="cd_remove_frame">Remove frame</string>
+    <string name="cd_toggle_frame">Toggle frame inclusion</string>
     <string name="cd_move_frame_left">Move frame earlier</string>
     <string name="cd_move_frame_right">Move frame later</string>
     <string name="cd_add_frames">Add more frames</string>
     <string name="cd_reset_zoom">Reset zoom and pan</string>
     <string name="cd_compare_slider">Drag to compare before and after</string>
+    <string name="cd_retouch_undo">Undo retouch stroke</string>
+    <string name="cd_retouch_redo">Redo retouch stroke</string>
     <string name="home_subtitle">Computational Darkroom</string>
     <string name="focus_stack_title">Focus Stack</string>
     <string name="focus_stack_subtitle">Merge macro &amp; landscape shots for edge-to-edge sharpness</string>

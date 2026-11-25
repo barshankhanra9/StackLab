@@ -81,11 +81,15 @@ fun StackLabNav(
                     viewModel.onPhotosSelected(uris, navigateToWorkspace = false)
                 },
                 onSelectPreview = viewModel::selectPreviewFrame,
+                onToggleFrameEnabled = viewModel::toggleFrameEnabled,
+                onAutoSortFocus = viewModel::autoSortFramesByFocusDistance,
                 onRemoveFrame = viewModel::removeFrame,
                 onMoveFrame = viewModel::moveFrame,
                 onAlignmentModeChange = viewModel::setAlignmentMode,
                 onBlendAlgorithmChange = viewModel::setBlendAlgorithm,
                 onEdgeSmoothingChange = viewModel::setEdgeSmoothingRadius,
+                onAutoCropBordersChange = viewModel::setAutoCropBorders,
+                onMaxResolutionChange = viewModel::updateMaxResolution,
                 onStartStacking = viewModel::startFocusStacking,
                 onCancelStacking = viewModel::cancelStacking,
                 onSnackbarConsumed = viewModel::consumeSnackbar
@@ -98,6 +102,16 @@ fun StackLabNav(
                 onNavigateBack = { navController.popBackStack() },
                 onSaveFullRes = viewModel::saveFullResolutionResult,
                 onNewStack = viewModel::startNewStack,
+                onToggleFocusPeaking = viewModel::toggleFocusPeaking,
+                onCompareFrameChanged = viewModel::updateComparePeakingIfEnabled,
+                onSetRetouchMode = viewModel::setRetouchMode,
+                onSelectRetouchSource = viewModel::selectRetouchSourceFrame,
+                onBrushSizeChange = viewModel::setRetouchBrushSize,
+                onFeatherChange = viewModel::setRetouchFeather,
+                onOpacityChange = viewModel::setRetouchOpacity,
+                onCommitRetouchStroke = viewModel::commitRetouchStroke,
+                onUndoRetouch = viewModel::undoRetouchStroke,
+                onRedoRetouch = viewModel::redoRetouchStroke,
                 onSnackbarConsumed = viewModel::consumeSnackbar
             )
         }

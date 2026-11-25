@@ -33,8 +33,8 @@ sealed class StackMode(
 
 enum class AlignmentMode(val label: String, val description: String) {
     AUTO_HOMOGRAPHY(
-        label = "Auto (Homography)",
-        description = "Fixes focus breathing & hand shake via ORB + RANSAC"
+        label = "Auto (ECC + ORB)",
+        description = "1024px ECC affine alignment with ORB + RANSAC homography fallback"
     ),
     NONE(
         label = "None (Tripod)",
@@ -60,9 +60,16 @@ enum class OutputFormat(val label: String, val mimeType: String, val extension: 
 
 enum class MaxResolutionPreset(val maxEdgePx: Int?, val label: String, val shortLabel: String) {
     ORIGINAL(null, "Original (Full Res)", "Full Res"),
-    UHD_4K(3840, "4K UHD (3840px)", "4K UHD"),
+    UHD_4K(4000, "High (4000px)", "4000px"),
     HD_2K(2048, "2K Studio (2048px)", "2K Studio"),
-    PROXY_1600(1600, "Fast Proxy (1600px)", "1600px")
+    PROXY_1600(1600, "Preview (1600px)", "1600px")
+}
+
+enum class FocusRegion(val label: String) {
+    NEAR("Near"),
+    MID("Mid"),
+    FAR("Far"),
+    ANALYZING("...")
 }
 
 data class OutputSettings(
@@ -75,6 +82,7 @@ data class FocusStackConfig(
     val alignmentMode: AlignmentMode = AlignmentMode.AUTO_HOMOGRAPHY,
     val blendAlgorithm: BlendAlgorithm = BlendAlgorithm.PYRAMID_PMAX,
     val edgeSmoothingRadius: Int = 3,
+    val autoCropBorders: Boolean = true,
     val outputSettings: OutputSettings = OutputSettings()
 )
 
@@ -91,7 +99,12 @@ data class StackFrame(
     val uri: Uri,
     val displayName: String,
     val width: Int,
-    val height: Int
+    val height: Int,
+    val isEnabled: Boolean = true,
+    val focusRegion: FocusRegion = FocusRegion.ANALYZING,
+    val focusDistanceScore: Float = 0.5f,
+    val peakSharpnessScore: Float = 0f,
+    val isAnalyzed: Boolean = false
 )
 
 data class StackProgress(
@@ -104,6 +117,8 @@ data class StackProgress(
 data class StackResult(
     val outputBitmap: Bitmap,
     val sourcePreviewBitmaps: List<Bitmap>,
+    val alignedSourceCachePaths: List<String>,
+    val referenceFrameUri: Uri?,
     val frameNames: List<String>,
     val defaultComparisonIndex: Int,
     val alignedFramesCount: Int,
@@ -112,5 +127,20 @@ data class StackResult(
     val proxyReason: String?,
     val outputWidth: Int,
     val outputHeight: Int,
-    val alignmentNote: String
+    val alignmentNote: String,
+    val wasAutoCropped: Boolean = false,
+    val resolutionPreset: MaxResolutionPreset = MaxResolutionPreset.UHD_4K
+)
+
+data class RetouchPoint(
+    val u: Float,
+    val v: Float
+)
+
+data class RetouchStroke(
+    val sourceFrameIndex: Int,
+    val points: List<RetouchPoint>,
+    val brushSizeFraction: Float,
+    val feather: Float,
+    val opacity: Float
 )

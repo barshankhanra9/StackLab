@@ -1,9 +1,13 @@
 package com.example.ui.screens
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
@@ -32,11 +36,16 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.Redo
+import androidx.compose.material.icons.automirrored.rounded.Undo
 import androidx.compose.material.icons.rounded.AddPhotoAlternate
+import androidx.compose.material.icons.rounded.Brush
+import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Compare
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Photo
 import androidx.compose.material.icons.rounded.SwapHoriz
+import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.ZoomOutMap
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -55,17 +64,22 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -76,7 +90,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.domain.model.RetouchPoint
 import com.example.ui.StackLabUiState
+import com.example.ui.components.RetouchBottomPanel
 import com.example.ui.theme.AmberAccent
 import com.example.ui.theme.AmberDim
 import com.example.ui.theme.CharcoalSurface
@@ -84,9 +100,11 @@ import com.example.ui.theme.CrispWhite
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.CyanDim
 import com.example.ui.theme.HairlineBorder
+import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.OnAmber
 import java.util.Locale
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 @Composable
@@ -95,6 +113,16 @@ fun ResultScreen(
     onNavigateBack: () -> Unit,
     onSaveFullRes: () -> Unit,
     onNewStack: () -> Unit,
+    onToggleFocusPeaking: (Int) -> Unit,
+    onCompareFrameChanged: (Int) -> Unit,
+    onSetRetouchMode: (Boolean) -> Unit,
+    onSelectRetouchSource: (Int) -> Unit,
+    onBrushSizeChange: (Float) -> Unit,
+    onFeatherChange: (Float) -> Unit,
+    onOpacityChange: (Float) -> Unit,
+    onCommitRetouchStroke: (List<RetouchPoint>) -> Unit,
+    onUndoRetouch: () -> Unit,
+    onRedoRetouch: () -> Unit,
     onSnackbarConsumed: () -> Unit
 ) {
     val result = uiState.result
@@ -109,6 +137,11 @@ fun ResultScreen(
 
     var scale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
+    var showRetouchMaskOverlay by remember { mutableStateOf(false) }
+
+    // Live stroke feedback state while finger is dragging in Retouch mode
+    val activeStrokePoints = remember { mutableStateListOf<RetouchPoint>() }
+    var activeCursorNorm by remember { mutableStateOf<RetouchPoint?>(null) }
 
     LaunchedEffect(uiState.snackbarMessage) {
         val message = uiState.snackbarMessage
@@ -118,148 +151,195 @@ fun ResultScreen(
         }
     }
 
+    LaunchedEffect(selectedCompareFrameIndex, uiState.isFocusPeakingEnabled) {
+        if (uiState.isFocusPeakingEnabled && result != null) {
+            onCompareFrameChanged(selectedCompareFrameIndex)
+        }
+    }
+
     Scaffold(
         containerColor = Color(0xFF0A0B0D),
         contentWindowInsets = WindowInsets.safeDrawing,
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         bottomBar = {
             if (result != null) {
-                Surface(
-                    color = CharcoalSurface.copy(alpha = 0.96f),
-                    border = BorderStroke(1.dp, HairlineBorder)
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .navigationBarsPadding()
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                if (uiState.isRetouchMode) {
+                    RetouchBottomPanel(
+                        sourceBitmaps = result.sourcePreviewBitmaps,
+                        selectedSourceIndex = uiState.retouchSourceIndex,
+                        outputWidth = result.outputWidth,
+                        outputHeight = result.outputHeight,
+                        brushSizeFraction = uiState.retouchBrushSizeFraction,
+                        feather = uiState.retouchFeather,
+                        opacity = uiState.retouchOpacity,
+                        isSaving = uiState.isSaving,
+                        onSelectSource = onSelectRetouchSource,
+                        onBrushSizeChange = onBrushSizeChange,
+                        onFeatherChange = onFeatherChange,
+                        onOpacityChange = onOpacityChange,
+                        onDoneRetouch = { onSetRetouchMode(false) },
+                        onSaveFullRes = onSaveFullRes
+                    )
+                } else {
+                    Surface(
+                        color = CharcoalSurface.copy(alpha = 0.96f),
+                        border = BorderStroke(1.dp, HairlineBorder)
                     ) {
-                        // Source Frame Selector Strip
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .navigationBarsPadding()
+                                .padding(horizontal = 16.dp, vertical = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            if (inspectSingleFrame) {
-                                item {
-                                    val selected = inspectingResultInSingleMode
-                                    Surface(
-                                        onClick = { inspectingResultInSingleMode = true },
-                                        shape = RoundedCornerShape(8.dp),
-                                        color = if (selected) AmberDim else ObsidianBackground,
-                                        border = BorderStroke(
-                                            1.dp,
-                                            if (selected) AmberAccent else HairlineBorder
-                                        )
-                                    ) {
+                            // Actual Output Dimensions & Telemetry Strip directly below image
+                            val actualW = result.outputBitmap.width
+                            val actualH = result.outputBitmap.height
+                            val megapixels = (actualW.toLong() * actualH.toLong()) / 1_000_000.0
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "$actualW × $actualH px (${String.format(Locale.US, "%.1f", megapixels)} MP)",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = AmberAccent,
+                                    modifier = Modifier.testTag("result_dimensions_text")
+                                )
+                                Text(
+                                    text = "${result.resolutionPreset.shortLabel} • ${result.alignmentNote}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MutedSlate
+                                )
+                            }
+
+                            // Source Frame Selector Strip
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (inspectSingleFrame) {
+                                    item {
+                                        val selected = inspectingResultInSingleMode
+                                        Surface(
+                                            onClick = { inspectingResultInSingleMode = true },
+                                            shape = RoundedCornerShape(8.dp),
+                                            color = if (selected) AmberDim else ObsidianBackground,
+                                            border = BorderStroke(
+                                                1.dp,
+                                                if (selected) AmberAccent else HairlineBorder
+                                            )
+                                        ) {
+                                            Text(
+                                                text = "STACKED",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = if (selected) AmberAccent else CrispWhite,
+                                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    item {
                                         Text(
-                                            text = "STACKED",
+                                            text = "BEFORE:",
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = if (selected) AmberAccent else CrispWhite,
-                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
+                                            color = CyanAccent,
+                                            modifier = Modifier.padding(end = 2.dp)
                                         )
                                     }
                                 }
-                            } else {
-                                item {
-                                    Text(
-                                        text = "BEFORE:",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = CyanAccent,
-                                        modifier = Modifier.padding(end = 2.dp)
-                                    )
+
+                                itemsIndexed(result.sourcePreviewBitmaps) { index, _ ->
+                                    val isCurrent = if (inspectSingleFrame) {
+                                        !inspectingResultInSingleMode && selectedCompareFrameIndex == index
+                                    } else {
+                                        selectedCompareFrameIndex == index
+                                    }
+                                    Surface(
+                                        onClick = {
+                                            selectedCompareFrameIndex = index
+                                            inspectingResultInSingleMode = false
+                                        },
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (isCurrent) CyanDim else ObsidianBackground,
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (isCurrent) CyanAccent else HairlineBorder
+                                        ),
+                                        modifier = Modifier.testTag("inspect_frame_$index")
+                                    ) {
+                                        Text(
+                                            text = "#${index + 1}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (isCurrent) CyanAccent else CrispWhite,
+                                            modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)
+                                        )
+                                    }
                                 }
                             }
 
-                            itemsIndexed(result.sourcePreviewBitmaps) { index, _ ->
-                                val isCurrent = if (inspectSingleFrame) {
-                                    !inspectingResultInSingleMode && selectedCompareFrameIndex == index
-                                } else {
-                                    selectedCompareFrameIndex == index
-                                }
-                                Surface(
-                                    onClick = {
-                                        selectedCompareFrameIndex = index
-                                        inspectingResultInSingleMode = false
-                                    },
-                                    shape = RoundedCornerShape(8.dp),
-                                    color = if (isCurrent) CyanDim else ObsidianBackground,
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (isCurrent) CyanAccent else HairlineBorder
-                                    ),
-                                    modifier = Modifier.testTag("inspect_frame_$index")
+                            // Primary Action Row
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                            ) {
+                                OutlinedButton(
+                                    onClick = onNewStack,
+                                    shape = RoundedCornerShape(14.dp),
+                                    border = BorderStroke(1.dp, HairlineBorder),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(50.dp)
+                                        .testTag("new_stack_button")
                                 ) {
-                                    Text(
-                                        text = "#${index + 1}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (isCurrent) CyanAccent else CrispWhite,
-                                        modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)
-                                    )
-                                }
-                            }
-                        }
-
-                        // Primary Action Row
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            OutlinedButton(
-                                onClick = onNewStack,
-                                shape = RoundedCornerShape(14.dp),
-                                border = BorderStroke(1.dp, HairlineBorder),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .height(50.dp)
-                                    .testTag("new_stack_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Rounded.AddPhotoAlternate,
-                                    contentDescription = null,
-                                    tint = CrispWhite,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = stringResource(R.string.new_stack),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = CrispWhite
-                                )
-                            }
-
-                            Button(
-                                onClick = onSaveFullRes,
-                                enabled = !uiState.isSaving,
-                                shape = RoundedCornerShape(14.dp),
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = AmberAccent,
-                                    contentColor = OnAmber
-                                ),
-                                contentPadding = PaddingValues(horizontal = 16.dp),
-                                modifier = Modifier
-                                    .weight(1.35f)
-                                    .height(50.dp)
-                                    .testTag("save_result_button")
-                            ) {
-                                if (uiState.isSaving) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(18.dp),
-                                        color = OnAmber,
-                                        strokeWidth = 2.dp
-                                    )
-                                } else {
                                     Icon(
-                                        imageVector = Icons.Rounded.Download,
+                                        imageVector = Icons.Rounded.AddPhotoAlternate,
                                         contentDescription = null,
+                                        tint = CrispWhite,
                                         modifier = Modifier.size(18.dp)
                                     )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = stringResource(R.string.new_stack),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = CrispWhite
+                                    )
                                 }
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = if (uiState.isSaving) "Exporting..." else stringResource(R.string.save_full_res),
-                                    style = MaterialTheme.typography.labelLarge
-                                )
+
+                                Button(
+                                    onClick = onSaveFullRes,
+                                    enabled = !uiState.isSaving,
+                                    shape = RoundedCornerShape(14.dp),
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = AmberAccent,
+                                        contentColor = OnAmber
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 16.dp),
+                                    modifier = Modifier
+                                        .weight(1.35f)
+                                        .height(50.dp)
+                                        .testTag("save_result_button")
+                                ) {
+                                    if (uiState.isSaving) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(18.dp),
+                                            color = OnAmber,
+                                            strokeWidth = 2.dp
+                                        )
+                                    } else {
+                                        Icon(
+                                            imageVector = Icons.Rounded.Download,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = if (uiState.isSaving) "Exporting..." else stringResource(R.string.save_full_res),
+                                        style = MaterialTheme.typography.labelLarge
+                                    )
+                                }
                             }
                         }
                     }
@@ -284,10 +364,25 @@ fun ResultScreen(
         }
 
         val safeCompareIdx = selectedCompareFrameIndex.coerceIn(0, result.sourcePreviewBitmaps.lastIndex)
-        val afterImageBitmap = remember(result.outputBitmap) { result.outputBitmap.asImageBitmap() }
+        val afterImageBitmap = remember(result.outputBitmap, uiState.retouchBitmapVersion) {
+            result.outputBitmap.asImageBitmap()
+        }
         val beforeImageBitmap = remember(result, safeCompareIdx) {
             result.sourcePreviewBitmaps[safeCompareIdx].asImageBitmap()
         }
+        val afterPeakingBitmap = remember(uiState.focusPeakingOverlayBitmap) {
+            uiState.focusPeakingOverlayBitmap?.takeIf { !it.isRecycled }?.asImageBitmap()
+        }
+        val beforePeakingBitmap = remember(uiState.comparePeakingOverlayBitmap) {
+            uiState.comparePeakingOverlayBitmap?.takeIf { !it.isRecycled }?.asImageBitmap()
+        }
+        val maskOverlayBitmap = remember(uiState.retouchMaskBitmap) {
+            uiState.retouchMaskBitmap?.takeIf { !it.isRecycled }?.asImageBitmap()
+        }
+
+        val latestScale by rememberUpdatedState(scale)
+        val latestPan by rememberUpdatedState(panOffset)
+        val latestCommitStroke by rememberUpdatedState(onCommitRetouchStroke)
 
         BoxWithConstraints(
             modifier = Modifier
@@ -298,9 +393,83 @@ fun ResultScreen(
             val containerWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
             val containerHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
 
-            // Synced pinch-to-zoom and pan canvas
-            Box(
-                modifier = Modifier
+            val imageW = result.outputBitmap.width.toFloat().coerceAtLeast(1f)
+            val imageH = result.outputBitmap.height.toFloat().coerceAtLeast(1f)
+            val fitScale = min(containerWidthPx / imageW, containerHeightPx / imageH)
+            val fittedW = imageW * fitScale
+            val fittedH = imageH * fitScale
+            val fitLeft = (containerWidthPx - fittedW) / 2f
+            val fitTop = (containerHeightPx - fittedH) / 2f
+
+            fun screenToNormalized(screenPt: Offset, curScale: Float, curPan: Offset): RetouchPoint {
+                val cx = containerWidthPx / 2f
+                val cy = containerHeightPx / 2f
+                val boxX = cx + (screenPt.x - cx - curPan.x) / curScale
+                val boxY = cy + (screenPt.y - cy - curPan.y) / curScale
+                val u = ((boxX - fitLeft) / fittedW).coerceIn(0f, 1f)
+                val v = ((boxY - fitTop) / fittedH).coerceIn(0f, 1f)
+                return RetouchPoint(u, v)
+            }
+
+            // Gesture canvas: Retouch mode (1-finger paint + 2-finger zoom) vs Compare/Inspect (transform + double tap)
+            val gestureModifier = if (uiState.isRetouchMode) {
+                Modifier
+                    .fillMaxSize()
+                    .pointerInput(containerWidthPx, containerHeightPx, imageW, imageH) {
+                        awaitEachGesture {
+                            val firstDown = awaitFirstDown(requireUnconsumed = false)
+                            var isMultiTouch = false
+                            activeStrokePoints.clear()
+                            val startNorm = screenToNormalized(firstDown.position, latestScale, latestPan)
+                            activeStrokePoints.add(startNorm)
+                            activeCursorNorm = startNorm
+
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val pressedCount = event.changes.count { it.pressed }
+                                if (pressedCount >= 2) {
+                                    if (!isMultiTouch) {
+                                        isMultiTouch = true
+                                        activeStrokePoints.clear()
+                                        activeCursorNorm = null
+                                    }
+                                    val zoomChange = event.calculateZoom()
+                                    val panChange = event.calculatePan()
+                                    val newScale = (latestScale * zoomChange).coerceIn(1f, 8f)
+                                    val maxPanX = ((newScale - 1f) * containerWidthPx) / 2f
+                                    val maxPanY = ((newScale - 1f) * containerHeightPx) / 2f
+                                    val nextOffset = if (newScale <= 1.01f) {
+                                        Offset.Zero
+                                    } else {
+                                        Offset(
+                                            x = (latestPan.x + panChange.x).coerceIn(-maxPanX, maxPanX),
+                                            y = (latestPan.y + panChange.y).coerceIn(-maxPanY, maxPanY)
+                                        )
+                                    }
+                                    scale = newScale
+                                    panOffset = nextOffset
+                                    event.changes.forEach { it.consume() }
+                                } else if (pressedCount == 1 && !isMultiTouch) {
+                                    val change = event.changes.firstOrNull { it.pressed }
+                                    if (change != null) {
+                                        change.consume()
+                                        val norm = screenToNormalized(change.position, latestScale, latestPan)
+                                        activeStrokePoints.add(norm)
+                                        activeCursorNorm = norm
+                                    }
+                                } else if (pressedCount == 0) {
+                                    if (!isMultiTouch && activeStrokePoints.isNotEmpty()) {
+                                        latestCommitStroke(activeStrokePoints.toList())
+                                    }
+                                    activeStrokePoints.clear()
+                                    activeCursorNorm = null
+                                    break
+                                }
+                            }
+                        }
+                    }
+            } else {
+                Modifier
                     .fillMaxSize()
                     .pointerInput(Unit) {
                         detectTransformGestures { _, pan, zoom, _ ->
@@ -331,7 +500,9 @@ fun ResultScreen(
                             }
                         )
                     }
-            ) {
+            }
+
+            Box(modifier = gestureModifier) {
                 val transformModifier = Modifier
                     .fillMaxSize()
                     .graphicsLayer(
@@ -341,15 +512,14 @@ fun ResultScreen(
                         translationY = panOffset.y
                     )
 
-                if (inspectSingleFrame) {
-                    val singleBitmap = if (inspectingResultInSingleMode) {
-                        afterImageBitmap
-                    } else {
-                        beforeImageBitmap
-                    }
+                if (uiState.isRetouchMode || inspectSingleFrame) {
+                    val showOutput = uiState.isRetouchMode || inspectingResultInSingleMode
+                    val singleBitmap = if (showOutput) afterImageBitmap else beforeImageBitmap
+                    val singlePeaking = if (showOutput) afterPeakingBitmap else beforePeakingBitmap
+
                     Image(
                         bitmap = singleBitmap,
-                        contentDescription = if (inspectingResultInSingleMode) {
+                        contentDescription = if (showOutput) {
                             "Stacked composite result"
                         } else {
                             "Source frame #${safeCompareIdx + 1}"
@@ -357,6 +527,65 @@ fun ResultScreen(
                         contentScale = ContentScale.Fit,
                         modifier = transformModifier
                     )
+
+                    if (uiState.isFocusPeakingEnabled && singlePeaking != null) {
+                        Image(
+                            bitmap = singlePeaking,
+                            contentDescription = "Focus peaking sharpness overlay",
+                            contentScale = ContentScale.Fit,
+                            modifier = transformModifier
+                        )
+                    }
+
+                    if (uiState.isRetouchMode && showRetouchMaskOverlay && maskOverlayBitmap != null) {
+                        Image(
+                            bitmap = maskOverlayBitmap,
+                            contentDescription = "Retouch painted mask overlay",
+                            contentScale = ContentScale.Fit,
+                            modifier = transformModifier
+                        )
+                    }
+
+                    // Live brush stroke preview & cursor ring inside same zoomed graphicsLayer
+                    if (uiState.isRetouchMode && (activeStrokePoints.isNotEmpty() || activeCursorNorm != null)) {
+                        Canvas(modifier = transformModifier) {
+                            val boxFitScale = min(size.width / imageW, size.height / imageH)
+                            val boxFittedW = imageW * boxFitScale
+                            val boxFittedH = imageH * boxFitScale
+                            val boxLeft = (size.width - boxFittedW) / 2f
+                            val boxTop = (size.height - boxFittedH) / 2f
+                            val radiusPx = (uiState.retouchBrushSizeFraction * min(boxFittedW, boxFittedH) * 0.5f)
+                                .coerceAtLeast(3f)
+
+                            if (activeStrokePoints.size >= 2) {
+                                val path = Path()
+                                activeStrokePoints.forEachIndexed { idx, pt ->
+                                    val x = boxLeft + pt.u * boxFittedW
+                                    val y = boxTop + pt.v * boxFittedH
+                                    if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                                }
+                                drawPath(
+                                    path = path,
+                                    color = CyanAccent.copy(alpha = 0.45f),
+                                    style = Stroke(
+                                        width = radiusPx * 2f,
+                                        cap = StrokeCap.Round,
+                                        join = StrokeJoin.Round
+                                    )
+                                )
+                            }
+                            activeCursorNorm?.let { cur ->
+                                val cx = boxLeft + cur.u * boxFittedW
+                                val cy = boxTop + cur.v * boxFittedH
+                                drawCircle(
+                                    color = AmberAccent,
+                                    radius = radiusPx,
+                                    center = Offset(cx, cy),
+                                    style = Stroke(width = 2.dp.toPx() / scale)
+                                )
+                            }
+                        }
+                    }
                 } else {
                     // Right side: Final Stacked Output
                     Image(
@@ -365,12 +594,17 @@ fun ResultScreen(
                         contentScale = ContentScale.Fit,
                         modifier = transformModifier
                     )
+                    if (uiState.isFocusPeakingEnabled && afterPeakingBitmap != null) {
+                        Image(
+                            bitmap = afterPeakingBitmap,
+                            contentDescription = "Focus peaking overlay on stacked output",
+                            contentScale = ContentScale.Fit,
+                            modifier = transformModifier
+                        )
+                    }
 
                     // Left side: Before (Source Frame #N) clipped dynamically by splitFraction
-                    Image(
-                        bitmap = beforeImageBitmap,
-                        contentDescription = "Before frame #${safeCompareIdx + 1}",
-                        contentScale = ContentScale.Fit,
+                    Box(
                         modifier = Modifier
                             .fillMaxSize()
                             .drawWithContent {
@@ -384,12 +618,27 @@ fun ResultScreen(
                                 translationX = panOffset.x,
                                 translationY = panOffset.y
                             )
-                    )
+                    ) {
+                        Image(
+                            bitmap = beforeImageBitmap,
+                            contentDescription = "Before frame #${safeCompareIdx + 1}",
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        if (uiState.isFocusPeakingEnabled && beforePeakingBitmap != null) {
+                            Image(
+                                bitmap = beforePeakingBitmap,
+                                contentDescription = "Focus peaking overlay on source frame",
+                                contentScale = ContentScale.Fit,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
                 }
             }
 
             // Interactive Before/After Split Divider & Handle
-            if (!inspectSingleFrame) {
+            if (!uiState.isRetouchMode && !inspectSingleFrame) {
                 val dividerX = (containerWidthPx * splitFraction).roundToInt()
                 val handleWidthPx = with(density) { 48.dp.toPx() }.roundToInt()
 
@@ -465,7 +714,7 @@ fun ResultScreen(
                     }
 
                     Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         if (scale > 1.05f) {
@@ -475,13 +724,13 @@ fun ResultScreen(
                                     panOffset = Offset.Zero
                                 },
                                 shape = RoundedCornerShape(10.dp),
-                                color = ObsidianBackground.copy(alpha = 0.82f),
+                                color = ObsidianBackground.copy(alpha = 0.84f),
                                 border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.6f))
                             ) {
                                 Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
                                     verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
                                     Icon(
                                         imageVector = Icons.Rounded.ZoomOutMap,
@@ -491,95 +740,262 @@ fun ResultScreen(
                                     )
                                     Text(
                                         text = String.format(Locale.US, "%.1fx", scale),
-                                        style = MaterialTheme.typography.labelMedium,
+                                        style = MaterialTheme.typography.labelSmall,
                                         color = AmberAccent
                                     )
                                 }
                             }
                         }
 
+                        // Focus Peaking Toggle Chip
                         Surface(
-                            onClick = { inspectSingleFrame = !inspectSingleFrame },
+                            onClick = { onToggleFocusPeaking(safeCompareIdx) },
                             shape = RoundedCornerShape(10.dp),
-                            color = ObsidianBackground.copy(alpha = 0.82f),
+                            color = if (uiState.isFocusPeakingEnabled) CyanDim.copy(alpha = 0.9f) else ObsidianBackground.copy(alpha = 0.84f),
                             border = BorderStroke(
                                 1.dp,
-                                if (inspectSingleFrame) AmberAccent else CyanAccent
+                                if (uiState.isFocusPeakingEnabled) CyanAccent else HairlineBorder
                             ),
-                            modifier = Modifier.testTag("toggle_inspect_mode")
+                            modifier = Modifier.testTag("toggle_focus_peaking")
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
                             ) {
                                 Icon(
-                                    imageVector = if (inspectSingleFrame) Icons.Rounded.Compare else Icons.Rounded.Photo,
+                                    imageVector = Icons.Rounded.CenterFocusStrong,
                                     contentDescription = null,
-                                    tint = if (inspectSingleFrame) AmberAccent else CyanAccent,
-                                    modifier = Modifier.size(16.dp)
+                                    tint = if (uiState.isFocusPeakingEnabled) CyanAccent else CrispWhite,
+                                    modifier = Modifier.size(15.dp)
                                 )
                                 Text(
-                                    text = if (inspectSingleFrame) "Split Compare" else "Inspect Frame",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = if (inspectSingleFrame) AmberAccent else CyanAccent
+                                    text = "Peaking",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (uiState.isFocusPeakingEnabled) CyanAccent else CrispWhite
                                 )
+                            }
+                        }
+
+                        // Retouch Mode Toggle Button
+                        Surface(
+                            onClick = { onSetRetouchMode(!uiState.isRetouchMode) },
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (uiState.isRetouchMode) AmberDim.copy(alpha = 0.92f) else ObsidianBackground.copy(alpha = 0.84f),
+                            border = BorderStroke(
+                                1.dp,
+                                if (uiState.isRetouchMode) AmberAccent else HairlineBorder
+                            ),
+                            modifier = Modifier.testTag("toggle_retouch_mode")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.Brush,
+                                    contentDescription = null,
+                                    tint = if (uiState.isRetouchMode) AmberAccent else CrispWhite,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(
+                                    text = "Retouch",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = if (uiState.isRetouchMode) AmberAccent else CrispWhite
+                                )
+                            }
+                        }
+
+                        if (!uiState.isRetouchMode) {
+                            Surface(
+                                onClick = { inspectSingleFrame = !inspectSingleFrame },
+                                shape = RoundedCornerShape(10.dp),
+                                color = ObsidianBackground.copy(alpha = 0.84f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (inspectSingleFrame) AmberAccent else CyanAccent
+                                ),
+                                modifier = Modifier.testTag("toggle_inspect_mode")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = if (inspectSingleFrame) Icons.Rounded.Compare else Icons.Rounded.Photo,
+                                        contentDescription = null,
+                                        tint = if (inspectSingleFrame) AmberAccent else CyanAccent,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Text(
+                                        text = if (inspectSingleFrame) "Split" else "Single",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (inspectSingleFrame) AmberAccent else CyanAccent
+                                    )
+                                }
                             }
                         }
                     }
                 }
 
-                // Comparison & Telemetry Badges
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (!inspectSingleFrame) {
-                        Surface(
-                            shape = RoundedCornerShape(6.dp),
-                            color = ObsidianBackground.copy(alpha = 0.78f),
-                            border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.4f))
+                // Retouch Undo/Redo/Show-Mask Sub-Bar OR Comparison Telemetry Badges
+                if (uiState.isRetouchMode) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = "BEFORE • #${safeCompareIdx + 1}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = CyanAccent,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                            )
+                            val canUndo = uiState.retouchUndoCount > 0 && !uiState.isApplyingRetouch
+                            val canRedo = uiState.retouchRedoCount > 0 && !uiState.isApplyingRetouch
+
+                            Surface(
+                                onClick = onUndoRetouch,
+                                enabled = canUndo,
+                                shape = RoundedCornerShape(8.dp),
+                                color = ObsidianBackground.copy(alpha = 0.84f),
+                                border = BorderStroke(1.dp, if (canUndo) CrispWhite.copy(alpha = 0.45f) else HairlineBorder),
+                                modifier = Modifier.testTag("retouch_undo_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Rounded.Undo,
+                                    contentDescription = stringResource(R.string.cd_retouch_undo),
+                                    tint = if (canUndo) CrispWhite else MutedSlate.copy(alpha = 0.4f),
+                                    modifier = Modifier
+                                        .padding(horizontal = 10.dp, vertical = 7.dp)
+                                        .size(18.dp)
+                                )
+                            }
+
+                            Surface(
+                                onClick = onRedoRetouch,
+                                enabled = canRedo,
+                                shape = RoundedCornerShape(8.dp),
+                                color = ObsidianBackground.copy(alpha = 0.84f),
+                                border = BorderStroke(1.dp, if (canRedo) CrispWhite.copy(alpha = 0.45f) else HairlineBorder),
+                                modifier = Modifier.testTag("retouch_redo_button")
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Rounded.Redo,
+                                    contentDescription = stringResource(R.string.cd_retouch_redo),
+                                    tint = if (canRedo) CrispWhite else MutedSlate.copy(alpha = 0.4f),
+                                    modifier = Modifier
+                                        .padding(horizontal = 10.dp, vertical = 7.dp)
+                                        .size(18.dp)
+                                )
+                            }
+
+                            // Press-and-hold Show Mask button
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (showRetouchMaskOverlay) CyanDim else ObsidianBackground.copy(alpha = 0.84f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (showRetouchMaskOverlay) CyanAccent else HairlineBorder
+                                ),
+                                modifier = Modifier
+                                    .pointerInput(Unit) {
+                                        detectTapGestures(
+                                            onPress = {
+                                                showRetouchMaskOverlay = true
+                                                tryAwaitRelease()
+                                                showRetouchMaskOverlay = false
+                                            }
+                                        )
+                                    }
+                                    .testTag("retouch_show_mask_button")
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Visibility,
+                                        contentDescription = null,
+                                        tint = if (showRetouchMaskOverlay) CyanAccent else CrispWhite,
+                                        modifier = Modifier.size(15.dp)
+                                    )
+                                    Text(
+                                        text = if (showRetouchMaskOverlay) "Mask Shown" else "Hold Mask",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (showRetouchMaskOverlay) CyanAccent else CrispWhite
+                                    )
+                                }
+                            }
                         }
-                    } else {
+
                         Surface(
                             shape = RoundedCornerShape(6.dp),
-                            color = ObsidianBackground.copy(alpha = 0.78f),
-                            border = BorderStroke(1.dp, HairlineBorder)
+                            color = ObsidianBackground.copy(alpha = 0.82f),
+                            border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.5f))
                         ) {
                             Text(
-                                text = if (inspectingResultInSingleMode) "VIEWING: STACKED OUTPUT"
-                                else "VIEWING: SOURCE #${safeCompareIdx + 1}",
+                                text = "SOURCE #${uiState.retouchSourceIndex + 1}",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = CrispWhite,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                color = AmberAccent,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                             )
                         }
                     }
-
-                    Surface(
-                        shape = RoundedCornerShape(6.dp),
-                        color = ObsidianBackground.copy(alpha = 0.78f),
-                        border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.4f))
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val secs = String.format(Locale.US, "%.1fs", result.processingTimeMs / 1000f)
-                        Text(
-                            text = if (inspectSingleFrame) {
-                                "${result.outputWidth}×${result.outputHeight} • $secs"
-                            } else {
-                                "AFTER • ${result.sourcePreviewBitmaps.size}F • $secs"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = AmberAccent,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
+                        if (!inspectSingleFrame) {
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = ObsidianBackground.copy(alpha = 0.78f),
+                                border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.4f))
+                            ) {
+                                Text(
+                                    text = "BEFORE • #${safeCompareIdx + 1}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CyanAccent,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                        } else {
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = ObsidianBackground.copy(alpha = 0.78f),
+                                border = BorderStroke(1.dp, HairlineBorder)
+                            ) {
+                                Text(
+                                    text = if (inspectingResultInSingleMode) "VIEWING: STACKED OUTPUT"
+                                    else "VIEWING: SOURCE #${safeCompareIdx + 1}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CrispWhite,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
+
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = ObsidianBackground.copy(alpha = 0.78f),
+                            border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.4f))
+                        ) {
+                            val secs = String.format(Locale.US, "%.1fs", result.processingTimeMs / 1000f)
+                            val cropTag = if (result.wasAutoCropped) " • CROPPED" else ""
+                            Text(
+                                text = if (inspectSingleFrame) {
+                                    "${result.outputWidth}×${result.outputHeight} • $secs$cropTag"
+                                } else {
+                                    "AFTER • ${result.sourcePreviewBitmaps.size}F • $secs$cropTag"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = AmberAccent,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
                     }
                 }
             }

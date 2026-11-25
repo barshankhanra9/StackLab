@@ -28,6 +28,7 @@ class ExampleUnitTest {
         assertEquals(AlignmentMode.AUTO_HOMOGRAPHY, config.alignmentMode)
         assertEquals(BlendAlgorithm.PYRAMID_PMAX, config.blendAlgorithm)
         assertEquals(3, config.edgeSmoothingRadius)
+        assertTrue(config.autoCropBorders)
         assertEquals(MaxResolutionPreset.UHD_4K, config.outputSettings.maxResolution)
         assertEquals(OutputFormat.JPEG, config.outputSettings.outputFormat)
         assertEquals(95, config.outputSettings.jpegQuality)
@@ -36,7 +37,7 @@ class ExampleUnitTest {
     @Test
     fun `resolution presets define expected edge caps`() {
         assertNull(MaxResolutionPreset.ORIGINAL.maxEdgePx)
-        assertEquals(3840, MaxResolutionPreset.UHD_4K.maxEdgePx)
+        assertEquals(4000, MaxResolutionPreset.UHD_4K.maxEdgePx)
         assertEquals(2048, MaxResolutionPreset.HD_2K.maxEdgePx)
         assertEquals(1600, MaxResolutionPreset.PROXY_1600.maxEdgePx)
     }
