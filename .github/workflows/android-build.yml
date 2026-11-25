@@ -1,0 +1,135 @@
+name: Build StackLab APKs
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build variant (auto uses release if signing secrets are set, otherwise debug)'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - debug
+          - release
+
+permissions:
+  contents: write
+
+jobs:
+  build-apks:
+    name: Build Universal, Old (armeabi-v7a) & New (arm64-v8a) APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Restore debug keystore
+        run: |
+          if [ ! -f debug.keystore ]; then
+            if [ -f debug.keystore.base64 ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            else
+              keytool -genkey -v -keystore debug.keystore \
+                -storepass android -alias androiddebugkey -keypass android \
+                -keyalg RSA -keysize 2048 -validity 10000 \
+                -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+
+      - name: Run unit tests
+        run: gradle :app:testDebugUnitTest --no-daemon
+
+      - name: Build 3 APKs (Universal, Old 32-bit, New 64-bit)
+        id: build
+        env:
+          INPUT_BUILD_TYPE: ${{ github.event.inputs.build_type || 'auto' }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          HAS_RELEASE_SECRETS=false
+          if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_PASSWORD" ]; then
+            HAS_RELEASE_SECRETS=true
+          fi
+
+          if [ "$INPUT_BUILD_TYPE" = "release" ] && [ "$HAS_RELEASE_SECRETS" != "true" ]; then
+            echo "::error::Release build requested, but KEYSTORE_BASE64, STORE_PASSWORD, or KEY_PASSWORD secrets are missing."
+            exit 1
+          fi
+
+          if [ "$INPUT_BUILD_TYPE" = "release" ] || { [ "$INPUT_BUILD_TYPE" = "auto" ] && [ "$HAS_RELEASE_SECRETS" = "true" ]; }; then
+            VARIANT="release"
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release-keystore.jks"
+            export KEYSTORE_PATH="$RUNNER_TEMP/release-keystore.jks"
+            gradle assembleRelease --no-daemon
+          else
+            VARIANT="debug"
+            gradle assembleDebug --no-daemon
+          fi
+
+          echo "variant=$VARIANT" >> "$GITHUB_OUTPUT"
+
+          APK_DIR="app/build/outputs/apk/$VARIANT"
+          mkdir -p dist-apks
+
+          cp "$APK_DIR/app-universal-$VARIANT.apk" "dist-apks/StackLab-universal-$VARIANT.apk"
+          cp "$APK_DIR/app-armeabi-v7a-$VARIANT.apk" "dist-apks/StackLab-old-device-armeabi-v7a-$VARIANT.apk"
+          cp "$APK_DIR/app-arm64-v8a-$VARIANT.apk" "dist-apks/StackLab-new-device-arm64-v8a-$VARIANT.apk"
+
+          echo "### Built APKs ($VARIANT)" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | File | Size |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          for f in dist-apks/*.apk; do
+            SIZE=$(du -h "$f" | cut -f1)
+            echo "| $(basename "$f") | \`$f\` | $SIZE |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          ls -lh dist-apks/
+
+      - name: Upload Universal APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: StackLab-universal-${{ steps.build.outputs.variant }}
+          path: dist-apks/StackLab-universal-${{ steps.build.outputs.variant }}.apk
+          if-no-files-found: error
+
+      - name: Upload Old Device APK (armeabi-v7a 32-bit)
+        uses: actions/upload-artifact@v4
+        with:
+          name: StackLab-old-device-armeabi-v7a-${{ steps.build.outputs.variant }}
+          path: dist-apks/StackLab-old-device-armeabi-v7a-${{ steps.build.outputs.variant }}.apk
+          if-no-files-found: error
+
+      - name: Upload New Device APK (arm64-v8a 64-bit)
+        uses: actions/upload-artifact@v4
+        with:
+          name: StackLab-new-device-arm64-v8a-${{ steps.build.outputs.variant }}
+          path: dist-apks/StackLab-new-device-arm64-v8a-${{ steps.build.outputs.variant }}.apk
+          if-no-files-found: error
+
+      - name: Create GitHub Release on Tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" dist-apks/*.apk \
+            --title "StackLab $TAG" \
+            --notes "Automated APK builds for Universal, Old devices (armeabi-v7a 32-bit), and New devices (arm64-v8a 64-bit)."
