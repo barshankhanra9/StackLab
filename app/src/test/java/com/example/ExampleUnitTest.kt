@@ -3,6 +3,7 @@ package com.example
 import com.example.domain.model.AlignmentMode
 import com.example.domain.model.BlendAlgorithm
 import com.example.domain.model.FocusStackConfig
+import com.example.domain.model.HdrConfig
 import com.example.domain.model.MaxResolutionPreset
 import com.example.domain.model.OutputFormat
 import com.example.domain.model.OutputSettings
@@ -16,9 +17,9 @@ import org.junit.Test
 class ExampleUnitTest {
 
     @Test
-    fun `stack modes expose active focus stack and coming soon modes`() {
+    fun `stack modes expose active focus and HDR modes and coming soon Astro mode`() {
         assertTrue(StackMode.FocusStack.isAvailable)
-        assertFalse(StackMode.HdrExposureBlend.isAvailable)
+        assertTrue(StackMode.HdrExposureBlend.isAvailable)
         assertFalse(StackMode.AstroNoiseStack.isAvailable)
     }
 
@@ -32,6 +33,18 @@ class ExampleUnitTest {
         assertEquals(MaxResolutionPreset.UHD_4K, config.outputSettings.maxResolution)
         assertEquals(OutputFormat.JPEG, config.outputSettings.outputFormat)
         assertEquals(95, config.outputSettings.jpegQuality)
+    }
+
+    @Test
+    fun `hdr config defaults use balanced Mertens weights and auto alignment`() {
+        val config = HdrConfig()
+        assertEquals(AlignmentMode.AUTO_HOMOGRAPHY, config.alignmentMode)
+        assertEquals(1.0f, config.contrastWeight, 1e-4f)
+        assertEquals(1.0f, config.saturationWeight, 1e-4f)
+        assertEquals(1.0f, config.exposureWeight, 1e-4f)
+        assertFalse(config.deghostingEnabled)
+        assertTrue(config.autoCropBorders)
+        assertEquals(MaxResolutionPreset.UHD_4K, config.outputSettings.maxResolution)
     }
 
     @Test

@@ -35,12 +35,16 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `stack modes include active focus stack and coming soon HDR and Astro modes`() {
+    fun `stack modes include active focus and HDR modes and coming soon Astro mode`() {
         val state = StackLabUiState()
         assertEquals(3, state.availableModes.size)
         assertTrue(StackMode.FocusStack.isAvailable)
-        assertFalse(StackMode.HdrExposureBlend.isAvailable)
+        assertTrue(StackMode.HdrExposureBlend.isAvailable)
         assertFalse(StackMode.AstroNoiseStack.isAvailable)
+        assertEquals(1.0f, state.hdrContrastWeight, 1e-4f)
+        assertEquals(1.0f, state.hdrSaturationWeight, 1e-4f)
+        assertEquals(1.0f, state.hdrExposureWeight, 1e-4f)
+        assertFalse(state.hdrDeghostingEnabled)
     }
 
     @Test

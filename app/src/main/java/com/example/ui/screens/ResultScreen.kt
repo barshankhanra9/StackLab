@@ -130,7 +130,7 @@ fun ResultScreen(
 
     var splitFraction by rememberSaveable { mutableFloatStateOf(0.5f) }
     var inspectSingleFrame by rememberSaveable { mutableStateOf(false) }
-    var selectedCompareFrameIndex by rememberSaveable {
+    var selectedCompareFrameIndex by rememberSaveable(result) {
         mutableIntStateOf(result?.defaultComparisonIndex ?: 0)
     }
     var inspectingResultInSingleMode by rememberSaveable { mutableStateOf(false) }
@@ -166,6 +166,7 @@ fun ResultScreen(
                 if (uiState.isRetouchMode) {
                     RetouchBottomPanel(
                         sourceBitmaps = result.sourcePreviewBitmaps,
+                        frameLabels = result.frameLabels,
                         selectedSourceIndex = uiState.retouchSourceIndex,
                         outputWidth = result.outputWidth,
                         outputHeight = result.outputHeight,
@@ -256,6 +257,8 @@ fun ResultScreen(
                                     } else {
                                         selectedCompareFrameIndex == index
                                     }
+                                    val labelTag = result.frameLabels.getOrNull(index)
+                                        ?.takeIf { it.isNotBlank() && it != "..." }
                                     Surface(
                                         onClick = {
                                             selectedCompareFrameIndex = index
@@ -270,7 +273,7 @@ fun ResultScreen(
                                         modifier = Modifier.testTag("inspect_frame_$index")
                                     ) {
                                         Text(
-                                            text = "#${index + 1}",
+                                            text = if (labelTag != null) "#${index + 1} $labelTag" else "#${index + 1}",
                                             style = MaterialTheme.typography.labelSmall,
                                             color = if (isCurrent) CyanAccent else CrispWhite,
                                             modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)
@@ -935,8 +938,14 @@ fun ResultScreen(
                             color = ObsidianBackground.copy(alpha = 0.82f),
                             border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.5f))
                         ) {
+                            val srcLabel = result.frameLabels.getOrNull(uiState.retouchSourceIndex)
+                                ?.takeIf { it.isNotBlank() && it != "..." }
                             Text(
-                                text = "SOURCE #${uiState.retouchSourceIndex + 1}",
+                                text = if (srcLabel != null) {
+                                    "SOURCE #${uiState.retouchSourceIndex + 1} • ${srcLabel.uppercase()}"
+                                } else {
+                                    "SOURCE #${uiState.retouchSourceIndex + 1}"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = AmberAccent,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
@@ -949,6 +958,9 @@ fun ResultScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val cmpLabel = result.frameLabels.getOrNull(safeCompareIdx)
+                            ?.takeIf { it.isNotBlank() && it != "..." }
+                        val cmpSuffix = if (cmpLabel != null) " (${cmpLabel.uppercase()})" else ""
                         if (!inspectSingleFrame) {
                             Surface(
                                 shape = RoundedCornerShape(6.dp),
@@ -956,7 +968,7 @@ fun ResultScreen(
                                 border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.4f))
                             ) {
                                 Text(
-                                    text = "BEFORE • #${safeCompareIdx + 1}",
+                                    text = "BEFORE • #${safeCompareIdx + 1}$cmpSuffix",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = CyanAccent,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -969,8 +981,15 @@ fun ResultScreen(
                                 border = BorderStroke(1.dp, HairlineBorder)
                             ) {
                                 Text(
-                                    text = if (inspectingResultInSingleMode) "VIEWING: STACKED OUTPUT"
-                                    else "VIEWING: SOURCE #${safeCompareIdx + 1}",
+                                    text = if (inspectingResultInSingleMode) {
+                                        if (result.stackMode == com.example.domain.model.StackMode.HdrExposureBlend) {
+                                            "VIEWING: HDR COMPOSITE"
+                                        } else {
+                                            "VIEWING: STACKED OUTPUT"
+                                        }
+                                    } else {
+                                        "VIEWING: SOURCE #${safeCompareIdx + 1}$cmpSuffix"
+                                    },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = CrispWhite,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)

@@ -48,8 +48,12 @@ import androidx.compose.material.icons.rounded.Crop
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Layers
+import androidx.compose.material.icons.rounded.MotionPhotosOff
+import androidx.compose.material.icons.rounded.PhotoLibrary
 import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Tune
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
@@ -90,9 +94,11 @@ import coil.compose.AsyncImage
 import com.example.R
 import com.example.domain.model.AlignmentMode
 import com.example.domain.model.BlendAlgorithm
+import com.example.domain.model.ExposureBracket
 import com.example.domain.model.FocusRegion
 import com.example.domain.model.MaxResolutionPreset
 import com.example.domain.model.StackFrame
+import com.example.domain.model.StackMode
 import com.example.ui.ProcessingUiState
 import com.example.ui.StackLabUiState
 import com.example.ui.components.ProcessingOverlay
@@ -109,6 +115,7 @@ import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.OnAmber
 import com.example.ui.theme.SubtleSurface
+import java.util.Locale
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -119,18 +126,23 @@ fun WorkspaceScreen(
     onAddFrames: (List<Uri>) -> Unit,
     onSelectPreview: (Int) -> Unit,
     onToggleFrameEnabled: (Int) -> Unit,
-    onAutoSortFocus: () -> Unit,
+    onAutoSort: () -> Unit,
     onRemoveFrame: (Int) -> Unit,
     onMoveFrame: (Int, Int) -> Unit,
     onAlignmentModeChange: (AlignmentMode) -> Unit,
     onBlendAlgorithmChange: (BlendAlgorithm) -> Unit,
     onEdgeSmoothingChange: (Int) -> Unit,
     onAutoCropBordersChange: (Boolean) -> Unit,
+    onHdrContrastWeightChange: (Float) -> Unit,
+    onHdrSaturationWeightChange: (Float) -> Unit,
+    onHdrExposureWeightChange: (Float) -> Unit,
+    onHdrDeghostingChange: (Boolean) -> Unit,
     onMaxResolutionChange: (MaxResolutionPreset) -> Unit,
     onStartStacking: () -> Unit,
     onCancelStacking: () -> Unit,
     onSnackbarConsumed: () -> Unit
 ) {
+    val isHdrMode = uiState.activeMode == StackMode.HdrExposureBlend
     var advancedExpanded by rememberSaveable { mutableStateOf(true) }
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -176,12 +188,26 @@ fun WorkspaceScreen(
                 title = {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         Text(
-                            text = "Stack Prep",
+                            text = if (isHdrMode) "HDR Prep" else "Stack Prep",
                             style = MaterialTheme.typography.titleLarge
                         )
+                        if (isHdrMode) {
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = CyanDim,
+                                border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.55f))
+                            ) {
+                                Text(
+                                    text = "HDR",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CyanAccent,
+                                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                                )
+                            }
+                        }
                         Surface(
                             shape = RoundedCornerShape(6.dp),
                             color = AmberDim,
@@ -241,7 +267,11 @@ fun WorkspaceScreen(
                 },
                 text = {
                     Text(
-                        text = stringResource(R.string.start_stacking),
+                        text = if (isHdrMode) {
+                            stringResource(R.string.blend_hdr)
+                        } else {
+                            stringResource(R.string.start_stacking)
+                        },
                         style = MaterialTheme.typography.labelLarge
                     )
                 },
@@ -270,12 +300,18 @@ fun WorkspaceScreen(
                 ActiveFrameStage(
                     frames = uiState.frames,
                     selectedIndex = uiState.selectedPreviewIndex,
+                    isHdrMode = isHdrMode,
+                    onPickPhotos = {
+                        addPickerLauncher.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                        )
+                    },
                     onToggleEnabled = onToggleFrameEnabled,
                     onMoveLeft = { idx -> onMoveFrame(idx, idx - 1) },
                     onMoveRight = { idx -> onMoveFrame(idx, idx + 1) }
                 )
 
-                // Horizontal Filmstrip + Focus Bracketing Analyzer Bar
+                // Horizontal Filmstrip + Analyzer Bar
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -288,7 +324,7 @@ fun WorkspaceScreen(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 Text(
-                                    text = "FOCUS FILMSTRIP",
+                                    text = if (isHdrMode) "EV BRACKET FILMSTRIP" else "FOCUS FILMSTRIP",
                                     style = MaterialTheme.typography.labelMedium,
                                     color = MutedSlate
                                 )
@@ -301,7 +337,11 @@ fun WorkspaceScreen(
                                 }
                             }
                             Text(
-                                text = "NEAR → MID → FAR • CHECKBOX TO INCLUDE",
+                                text = if (isHdrMode) {
+                                    "DARK → MID → BRIGHT • CHECKBOX TO INCLUDE"
+                                } else {
+                                    "NEAR → MID → FAR • CHECKBOX TO INCLUDE"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MutedSlate
                             )
@@ -309,12 +349,12 @@ fun WorkspaceScreen(
 
                         if (uiState.frames.size >= 2) {
                             Surface(
-                                onClick = onAutoSortFocus,
+                                onClick = onAutoSort,
                                 enabled = !uiState.isAnalyzingFocus,
                                 shape = RoundedCornerShape(10.dp),
                                 color = CyanDim.copy(alpha = 0.7f),
                                 border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.55f)),
-                                modifier = Modifier.testTag("auto_sort_focus_button")
+                                modifier = Modifier.testTag("auto_sort_button")
                             ) {
                                 Row(
                                     modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
@@ -328,7 +368,7 @@ fun WorkspaceScreen(
                                         modifier = Modifier.size(15.dp)
                                     )
                                     Text(
-                                        text = "Auto-Sort Focus",
+                                        text = if (isHdrMode) "Auto-Sort EV" else "Auto-Sort Focus",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = CyanAccent
                                     )
@@ -350,6 +390,7 @@ fun WorkspaceScreen(
                                 frame = frame,
                                 index = index,
                                 totalCount = uiState.frames.size,
+                                isHdrMode = isHdrMode,
                                 isSelected = index == uiState.selectedPreviewIndex,
                                 onSelect = { onSelectPreview(index) },
                                 onToggleEnabled = { onToggleFrameEnabled(index) },
@@ -398,17 +439,26 @@ fun WorkspaceScreen(
                 // Collapsible Advanced Stack Settings Card
                 AdvancedStackSettingsCard(
                     expanded = advancedExpanded,
+                    isHdrMode = isHdrMode,
                     onToggleExpanded = { advancedExpanded = !advancedExpanded },
                     maxResolution = uiState.outputSettings.maxResolution,
                     alignmentMode = uiState.alignmentMode,
                     blendAlgorithm = uiState.blendAlgorithm,
                     edgeSmoothingRadius = uiState.edgeSmoothingRadius,
                     autoCropBorders = uiState.autoCropBorders,
+                    hdrContrastWeight = uiState.hdrContrastWeight,
+                    hdrSaturationWeight = uiState.hdrSaturationWeight,
+                    hdrExposureWeight = uiState.hdrExposureWeight,
+                    hdrDeghostingEnabled = uiState.hdrDeghostingEnabled,
                     onMaxResolutionChange = onMaxResolutionChange,
                     onAlignmentModeChange = onAlignmentModeChange,
                     onBlendAlgorithmChange = onBlendAlgorithmChange,
                     onEdgeSmoothingChange = onEdgeSmoothingChange,
-                    onAutoCropBordersChange = onAutoCropBordersChange
+                    onAutoCropBordersChange = onAutoCropBordersChange,
+                    onHdrContrastWeightChange = onHdrContrastWeightChange,
+                    onHdrSaturationWeightChange = onHdrSaturationWeightChange,
+                    onHdrExposureWeightChange = onHdrExposureWeightChange,
+                    onHdrDeghostingChange = onHdrDeghostingChange
                 )
             }
         }
@@ -427,6 +477,8 @@ fun WorkspaceScreen(
 private fun ActiveFrameStage(
     frames: List<StackFrame>,
     selectedIndex: Int,
+    isHdrMode: Boolean,
+    onPickPhotos: () -> Unit,
     onToggleEnabled: (Int) -> Unit,
     onMoveLeft: (Int) -> Unit,
     onMoveRight: (Int) -> Unit
@@ -442,22 +494,49 @@ private fun ActiveFrameStage(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(210.dp),
+                    .height(224.dp)
+                    .padding(horizontal = 24.dp),
                 contentAlignment = Alignment.Center
             ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
                     Icon(
                         imageVector = Icons.Rounded.Layers,
                         contentDescription = null,
-                        tint = MutedSlate,
+                        tint = if (isHdrMode) CyanAccent else MutedSlate,
                         modifier = Modifier.size(36.dp)
                     )
-                    Spacer(modifier = Modifier.height(8.dp))
                     Text(
-                        text = "Add at least 2 photos to begin focus stacking",
+                        text = if (isHdrMode) {
+                            "Select 2+ bracketed exposures (Dark, Mid, Bright) to blend HDR"
+                        } else {
+                            "Add at least 2 photos to begin focus stacking"
+                        },
                         style = MaterialTheme.typography.bodyMedium,
                         color = MutedSlate
                     )
+                    Button(
+                        onClick = onPickPhotos,
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AmberAccent,
+                            contentColor = OnAmber
+                        ),
+                        modifier = Modifier.testTag("workspace_pick_photos_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.PhotoLibrary,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isHdrMode) "Select Bracketed Photos" else "Select Photos",
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
                 }
             }
         } else {
@@ -498,14 +577,23 @@ private fun ActiveFrameStage(
                         }
 
                         if (activeFrame.isAnalyzed) {
-                            val badgeColor = focusRegionColor(activeFrame.focusRegion)
+                            val badgeLabel = if (isHdrMode) {
+                                activeFrame.exposureBracket.label.uppercase()
+                            } else {
+                                activeFrame.focusRegion.label.uppercase()
+                            }
+                            val badgeColor = if (isHdrMode) {
+                                exposureBracketColor(activeFrame.exposureBracket)
+                            } else {
+                                focusRegionColor(activeFrame.focusRegion)
+                            }
                             Surface(
                                 shape = RoundedCornerShape(8.dp),
                                 color = ObsidianBackground.copy(alpha = 0.82f),
                                 border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.6f))
                             ) {
                                 Text(
-                                    text = activeFrame.focusRegion.label.uppercase(),
+                                    text = badgeLabel,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = badgeColor,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -617,6 +705,7 @@ private fun FilmstripFrameCard(
     frame: StackFrame,
     index: Int,
     totalCount: Int,
+    isHdrMode: Boolean,
     isSelected: Boolean,
     onSelect: () -> Unit,
     onToggleEnabled: () -> Unit,
@@ -624,7 +713,12 @@ private fun FilmstripFrameCard(
     onMoveLeft: () -> Unit,
     onMoveRight: () -> Unit
 ) {
-    val focusBadgeColor = focusRegionColor(frame.focusRegion)
+    val badgeLabel = if (isHdrMode) frame.exposureBracket.label else frame.focusRegion.label
+    val badgeColor = if (isHdrMode) {
+        exposureBracketColor(frame.exposureBracket)
+    } else {
+        focusRegionColor(frame.focusRegion)
+    }
 
     Surface(
         shape = RoundedCornerShape(14.dp),
@@ -658,7 +752,7 @@ private fun FilmstripFrameCard(
                         .alpha(if (frame.isEnabled) 1f else 0.38f)
                 )
 
-                // Top-left index & focus region badge
+                // Top-left index badge
                 Surface(
                     shape = RoundedCornerShape(6.dp),
                     color = ObsidianBackground.copy(alpha = 0.86f),
@@ -674,19 +768,20 @@ private fun FilmstripFrameCard(
                     )
                 }
 
-                // Bottom-left focus distance badge (Near / Mid / Far)
+                // Bottom-left focus or brightness badge (Near/Mid/Far or Dark/Mid/Bright)
                 Surface(
                     shape = RoundedCornerShape(5.dp),
                     color = ObsidianBackground.copy(alpha = 0.86f),
-                    border = BorderStroke(1.dp, focusBadgeColor.copy(alpha = 0.5f)),
+                    border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.5f)),
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .padding(5.dp)
+                        .testTag("filmstrip_badge_$index")
                 ) {
                     Text(
-                        text = frame.focusRegion.label,
+                        text = badgeLabel,
                         style = MaterialTheme.typography.labelSmall,
-                        color = focusBadgeColor,
+                        color = badgeColor,
                         modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
                     )
                 }
@@ -822,20 +917,38 @@ private fun focusRegionColor(region: FocusRegion): Color {
     }
 }
 
+private fun exposureBracketColor(bracket: ExposureBracket): Color {
+    return when (bracket) {
+        ExposureBracket.DARK -> CyanAccent
+        ExposureBracket.MID -> EmeraldSuccess
+        ExposureBracket.BRIGHT -> AmberAccent
+        ExposureBracket.ANALYZING -> MutedSlate
+    }
+}
+
 @Composable
 private fun AdvancedStackSettingsCard(
     expanded: Boolean,
+    isHdrMode: Boolean,
     onToggleExpanded: () -> Unit,
     maxResolution: MaxResolutionPreset,
     alignmentMode: AlignmentMode,
     blendAlgorithm: BlendAlgorithm,
     edgeSmoothingRadius: Int,
     autoCropBorders: Boolean,
+    hdrContrastWeight: Float,
+    hdrSaturationWeight: Float,
+    hdrExposureWeight: Float,
+    hdrDeghostingEnabled: Boolean,
     onMaxResolutionChange: (MaxResolutionPreset) -> Unit,
     onAlignmentModeChange: (AlignmentMode) -> Unit,
     onBlendAlgorithmChange: (BlendAlgorithm) -> Unit,
     onEdgeSmoothingChange: (Int) -> Unit,
-    onAutoCropBordersChange: (Boolean) -> Unit
+    onAutoCropBordersChange: (Boolean) -> Unit,
+    onHdrContrastWeightChange: (Float) -> Unit,
+    onHdrSaturationWeightChange: (Float) -> Unit,
+    onHdrExposureWeightChange: (Float) -> Unit,
+    onHdrDeghostingChange: (Boolean) -> Unit
 ) {
     Surface(
         shape = RoundedCornerShape(18.dp),
@@ -869,10 +982,16 @@ private fun AdvancedStackSettingsCard(
                             color = CrispWhite
                         )
                         val alignShort = if (alignmentMode == AlignmentMode.AUTO_HOMOGRAPHY) "ECC + ORB" else "Tripod"
-                        val blendShort = if (blendAlgorithm == BlendAlgorithm.PYRAMID_PMAX) "PMax" else "DMap"
-                        val cropShort = if (autoCropBorders) "Auto-Crop" else "Full Canvas"
+                        val summaryLine = if (isHdrMode) {
+                            val deghostTag = if (hdrDeghostingEnabled) " • Deghost" else ""
+                            "${maxResolution.shortLabel} • $alignShort • C:${formatWeight(hdrContrastWeight)} S:${formatWeight(hdrSaturationWeight)} E:${formatWeight(hdrExposureWeight)}$deghostTag"
+                        } else {
+                            val blendShort = if (blendAlgorithm == BlendAlgorithm.PYRAMID_PMAX) "PMax" else "DMap"
+                            val cropShort = if (autoCropBorders) "Auto-Crop" else "Full Canvas"
+                            "${maxResolution.shortLabel} • $alignShort • $blendShort • ${edgeSmoothingRadius * 2 + 1}px • $cropShort"
+                        }
                         Text(
-                            text = "${maxResolution.shortLabel} • $alignShort • $blendShort • ${edgeSmoothingRadius * 2 + 1}px • $cropShort",
+                            text = summaryLine,
                             style = MaterialTheme.typography.labelSmall,
                             color = CyanAccent
                         )
@@ -997,78 +1116,159 @@ private fun AdvancedStackSettingsCard(
                         )
                     }
 
-                    // Blend Algorithm
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text(
-                            text = "BLEND ALGORITHM",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MutedSlate
+                    if (isHdrMode) {
+                        // Contrast Weight Slider
+                        HdrWeightSlider(
+                            title = "CONTRAST WEIGHT",
+                            subtitle = "Controls local detail punch",
+                            value = hdrContrastWeight,
+                            accentColor = AmberAccent,
+                            testTag = "hdr_contrast_slider",
+                            onValueChange = onHdrContrastWeightChange
                         )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            BlendAlgorithm.entries.forEach { algo ->
-                                val selected = algo == blendAlgorithm
-                                Surface(
-                                    onClick = { onBlendAlgorithmChange(algo) },
-                                    shape = RoundedCornerShape(12.dp),
-                                    color = if (selected) CyanDim else ElevatedCharcoal,
-                                    border = BorderStroke(
-                                        1.dp,
-                                        if (selected) CyanAccent else HairlineBorder
-                                    ),
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .testTag("blend_${algo.name}")
-                                ) {
-                                    Text(
-                                        text = algo.label,
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = if (selected) CyanAccent else CrispWhite,
-                                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp)
-                                    )
-                                }
-                            }
-                        }
-                        Text(
-                            text = blendAlgorithm.description,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
 
-                    // Edge Smoothing Slider
-                    Column {
+                        // Saturation Weight Slider
+                        HdrWeightSlider(
+                            title = "SATURATION WEIGHT",
+                            subtitle = "Controls color richness in blended shadows & highlights",
+                            value = hdrSaturationWeight,
+                            accentColor = CyanAccent,
+                            testTag = "hdr_saturation_slider",
+                            onValueChange = onHdrSaturationWeightChange
+                        )
+
+                        // Exposure Balance Slider
+                        HdrWeightSlider(
+                            title = "EXPOSURE BALANCE",
+                            subtitle = "Favors well-exposed midtones over clipped highlights/shadows",
+                            value = hdrExposureWeight,
+                            accentColor = AmberAccent,
+                            testTag = "hdr_exposure_slider",
+                            onValueChange = onHdrExposureWeightChange
+                        )
+
+                        HorizontalDivider(color = HairlineBorder)
+
+                        // Deghosting Toggle
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onHdrDeghostingChange(!hdrDeghostingEnabled) }
+                                .padding(vertical = 2.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            Row(
+                                modifier = Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.MotionPhotosOff,
+                                    contentDescription = null,
+                                    tint = CyanAccent,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Column {
+                                    Text(
+                                        text = "Deghosting",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = CrispWhite
+                                    )
+                                    Text(
+                                        text = "Suppress moving subjects (leaves, water, people) across brackets",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Switch(
+                                checked = hdrDeghostingEnabled,
+                                onCheckedChange = onHdrDeghostingChange,
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = OnAmber,
+                                    checkedTrackColor = AmberAccent,
+                                    uncheckedThumbColor = MutedSlate,
+                                    uncheckedTrackColor = ElevatedCharcoal
+                                ),
+                                modifier = Modifier.testTag("hdr_deghosting_switch")
+                            )
+                        }
+                    } else {
+                        // Blend Algorithm
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(
-                                text = "EDGE SMOOTHING",
+                                text = "BLEND ALGORITHM",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MutedSlate
                             )
-                            val kernel = edgeSmoothingRadius * 2 + 1
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                BlendAlgorithm.entries.forEach { algo ->
+                                    val selected = algo == blendAlgorithm
+                                    Surface(
+                                        onClick = { onBlendAlgorithmChange(algo) },
+                                        shape = RoundedCornerShape(12.dp),
+                                        color = if (selected) CyanDim else ElevatedCharcoal,
+                                        border = BorderStroke(
+                                            1.dp,
+                                            if (selected) CyanAccent else HairlineBorder
+                                        ),
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .testTag("blend_${algo.name}")
+                                    ) {
+                                        Text(
+                                            text = algo.label,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = if (selected) CyanAccent else CrispWhite,
+                                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp)
+                                        )
+                                    }
+                                }
+                            }
                             Text(
-                                text = "${kernel}×${kernel} px Gaussian",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = AmberAccent
+                                text = blendAlgorithm.description,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        Slider(
-                            value = edgeSmoothingRadius.toFloat(),
-                            onValueChange = { onEdgeSmoothingChange(it.roundToInt()) },
-                            valueRange = 1f..10f,
-                            steps = 8,
-                            colors = SliderDefaults.colors(
-                                thumbColor = AmberAccent,
-                                activeTrackColor = AmberAccent,
-                                inactiveTrackColor = HairlineBorder
-                            ),
-                            modifier = Modifier.testTag("edge_smoothing_slider")
-                        )
+
+                        // Edge Smoothing Slider
+                        Column {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "EDGE SMOOTHING",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = MutedSlate
+                                )
+                                val kernel = edgeSmoothingRadius * 2 + 1
+                                Text(
+                                    text = "${kernel}×${kernel} px Gaussian",
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = AmberAccent
+                                )
+                            }
+                            Slider(
+                                value = edgeSmoothingRadius.toFloat(),
+                                onValueChange = { onEdgeSmoothingChange(it.roundToInt()) },
+                                valueRange = 1f..10f,
+                                steps = 8,
+                                colors = SliderDefaults.colors(
+                                    thumbColor = AmberAccent,
+                                    activeTrackColor = AmberAccent,
+                                    inactiveTrackColor = HairlineBorder
+                                ),
+                                modifier = Modifier.testTag("edge_smoothing_slider")
+                            )
+                        }
                     }
 
                     HorizontalDivider(color = HairlineBorder)
@@ -1123,4 +1323,53 @@ private fun AdvancedStackSettingsCard(
             }
         }
     }
+}
+
+@Composable
+private fun HdrWeightSlider(
+    title: String,
+    subtitle: String,
+    value: Float,
+    accentColor: Color,
+    testTag: String,
+    onValueChange: (Float) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelMedium,
+                color = MutedSlate
+            )
+            Text(
+                text = formatWeight(value),
+                style = MaterialTheme.typography.labelMedium,
+                color = accentColor
+            )
+        }
+        Text(
+            text = subtitle,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Slider(
+            value = value,
+            onValueChange = { onValueChange(((it * 20f).roundToInt() / 20f).coerceIn(0f, 2f)) },
+            valueRange = 0f..2f,
+            colors = SliderDefaults.colors(
+                thumbColor = accentColor,
+                activeTrackColor = accentColor,
+                inactiveTrackColor = HairlineBorder
+            ),
+            modifier = Modifier.testTag(testTag)
+        )
+    }
+}
+
+private fun formatWeight(value: Float): String {
+    return String.format(Locale.US, "%.2f", value)
 }

@@ -63,8 +63,13 @@ fun StackLabNav(
             HomeScreen(
                 uiState = uiState,
                 onPhotosPicked = { uris ->
-                    viewModel.onPhotosSelected(uris, navigateToWorkspace = true)
+                    viewModel.onPhotosSelected(
+                        uris = uris,
+                        navigateToWorkspace = true,
+                        mode = com.example.domain.model.StackMode.FocusStack
+                    )
                 },
+                onHdrModeClicked = viewModel::openHdrWorkspace,
                 onComingSoonClicked = viewModel::onComingSoonModeClicked,
                 onSelectResolution = viewModel::updateMaxResolution,
                 onSelectFormat = viewModel::updateOutputFormat,
@@ -82,15 +87,25 @@ fun StackLabNav(
                 },
                 onSelectPreview = viewModel::selectPreviewFrame,
                 onToggleFrameEnabled = viewModel::toggleFrameEnabled,
-                onAutoSortFocus = viewModel::autoSortFramesByFocusDistance,
+                onAutoSort = {
+                    if (uiState.activeMode == com.example.domain.model.StackMode.HdrExposureBlend) {
+                        viewModel.autoSortFramesByEv()
+                    } else {
+                        viewModel.autoSortFramesByFocusDistance()
+                    }
+                },
                 onRemoveFrame = viewModel::removeFrame,
                 onMoveFrame = viewModel::moveFrame,
                 onAlignmentModeChange = viewModel::setAlignmentMode,
                 onBlendAlgorithmChange = viewModel::setBlendAlgorithm,
                 onEdgeSmoothingChange = viewModel::setEdgeSmoothingRadius,
                 onAutoCropBordersChange = viewModel::setAutoCropBorders,
+                onHdrContrastWeightChange = viewModel::setHdrContrastWeight,
+                onHdrSaturationWeightChange = viewModel::setHdrSaturationWeight,
+                onHdrExposureWeightChange = viewModel::setHdrExposureWeight,
+                onHdrDeghostingChange = viewModel::setHdrDeghostingEnabled,
                 onMaxResolutionChange = viewModel::updateMaxResolution,
-                onStartStacking = viewModel::startFocusStacking,
+                onStartStacking = viewModel::startStacking,
                 onCancelStacking = viewModel::cancelStacking,
                 onSnackbarConsumed = viewModel::consumeSnackbar
             )

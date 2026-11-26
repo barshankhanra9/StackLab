@@ -26,6 +26,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowForward
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Camera
 import androidx.compose.material.icons.rounded.CenterFocusStrong
@@ -87,6 +88,7 @@ import com.example.ui.theme.OnAmber
 fun HomeScreen(
     uiState: StackLabUiState,
     onPhotosPicked: (List<android.net.Uri>) -> Unit,
+    onHdrModeClicked: () -> Unit,
     onComingSoonClicked: (StackMode) -> Unit,
     onSelectResolution: (MaxResolutionPreset) -> Unit,
     onSelectFormat: (OutputFormat) -> Unit,
@@ -250,10 +252,10 @@ fun HomeScreen(
 
                 // Secondary Cards wired to StackMode sealed hierarchy
                 uiState.availableModes
-                    .filter { !it.isAvailable }
+                    .filter { it != StackMode.FocusStack }
                     .forEach { mode ->
                         val (icon, specsTag) = when (mode) {
-                            StackMode.HdrExposureBlend -> Icons.Rounded.Exposure to "EV Bracketing • Tone Mapping"
+                            StackMode.HdrExposureBlend -> Icons.Rounded.Exposure to "EV Bracketing • Mertens Pyramid Fusion"
                             StackMode.AstroNoiseStack -> Icons.Rounded.NightsStay to "Star Alignment • Sigma Clip"
                             StackMode.FocusStack -> Icons.Rounded.CenterFocusStrong to "Laplacian Pyramid"
                         }
@@ -261,7 +263,12 @@ fun HomeScreen(
                             mode = mode,
                             icon = icon,
                             specsTag = specsTag,
-                            onClick = { onComingSoonClicked(mode) }
+                            onClick = {
+                                when {
+                                    mode == StackMode.HdrExposureBlend && mode.isAvailable -> onHdrModeClicked()
+                                    else -> onComingSoonClicked(mode)
+                                }
+                            }
                         )
                     }
 
@@ -421,11 +428,15 @@ private fun SecondaryStackModeCard(
     specsTag: String,
     onClick: () -> Unit
 ) {
+    val isActiveMode = mode.isAvailable
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(18.dp),
         color = CharcoalSurface,
-        border = BorderStroke(1.dp, HairlineBorder),
+        border = BorderStroke(
+            1.dp,
+            if (isActiveMode) CyanAccent.copy(alpha = 0.45f) else HairlineBorder
+        ),
         modifier = Modifier
             .fillMaxWidth()
             .testTag("mode_card_${mode.id}")
@@ -440,7 +451,7 @@ private fun SecondaryStackModeCard(
                 modifier = Modifier
                     .size(50.dp)
                     .clip(RoundedCornerShape(14.dp))
-                    .background(ElevatedCharcoal),
+                    .background(if (isActiveMode) CyanDim else ElevatedCharcoal),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(
@@ -464,27 +475,53 @@ private fun SecondaryStackModeCard(
                         style = MaterialTheme.typography.titleLarge,
                         color = CrispWhite
                     )
-                    Surface(
-                        shape = RoundedCornerShape(6.dp),
-                        color = AmberDim,
-                        border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.45f))
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    if (isActiveMode) {
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = CyanDim,
+                            border = BorderStroke(1.dp, CyanAccent.copy(alpha = 0.6f))
                         ) {
-                            Icon(
-                                imageVector = Icons.Rounded.AutoAwesome,
-                                contentDescription = null,
-                                tint = AmberAccent,
-                                modifier = Modifier.size(11.dp)
-                            )
-                            Text(
-                                text = "COMING SOON",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = AmberAccent
-                            )
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = "OPEN",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CyanAccent
+                                )
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Rounded.ArrowForward,
+                                    contentDescription = null,
+                                    tint = CyanAccent,
+                                    modifier = Modifier.size(12.dp)
+                                )
+                            }
+                        }
+                    } else {
+                        Surface(
+                            shape = RoundedCornerShape(6.dp),
+                            color = AmberDim,
+                            border = BorderStroke(1.dp, AmberAccent.copy(alpha = 0.45f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.AutoAwesome,
+                                    contentDescription = null,
+                                    tint = AmberAccent,
+                                    modifier = Modifier.size(11.dp)
+                                )
+                                Text(
+                                    text = "COMING SOON",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = AmberAccent
+                                )
+                            }
                         }
                     }
                 }
@@ -499,7 +536,7 @@ private fun SecondaryStackModeCard(
                 Text(
                     text = specsTag,
                     style = MaterialTheme.typography.labelSmall,
-                    color = MutedSlate
+                    color = if (isActiveMode) CyanAccent else MutedSlate
                 )
             }
         }

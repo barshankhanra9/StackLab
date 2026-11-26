@@ -60,6 +60,7 @@ import kotlin.math.roundToInt
 @Composable
 fun RetouchBottomPanel(
     sourceBitmaps: List<Bitmap>,
+    frameLabels: List<String> = emptyList(),
     selectedSourceIndex: Int,
     outputWidth: Int,
     outputHeight: Int,
@@ -122,6 +123,7 @@ fun RetouchBottomPanel(
                 itemsIndexed(sourceBitmaps) { index, bmp ->
                     val selected = index == selectedSourceIndex
                     val imageBmp = remember(bmp) { bmp.asImageBitmap() }
+                    val labelTag = frameLabels.getOrNull(index)?.takeIf { it.isNotBlank() && it != "..." }
                     Surface(
                         onClick = { onSelectSource(index) },
                         shape = RoundedCornerShape(10.dp),
@@ -131,7 +133,7 @@ fun RetouchBottomPanel(
                             color = if (selected) CyanAccent else HairlineBorder
                         ),
                         modifier = Modifier
-                            .size(width = 62.dp, height = 48.dp)
+                            .size(width = if (labelTag != null) 74.dp else 62.dp, height = 48.dp)
                             .testTag("retouch_source_$index")
                     ) {
                         Box(modifier = Modifier.fillMaxSize()) {
@@ -144,11 +146,11 @@ fun RetouchBottomPanel(
                             Box(
                                 modifier = Modifier
                                     .align(Alignment.BottomStart)
-                                    .background(ObsidianBackground.copy(alpha = 0.82f))
+                                    .background(ObsidianBackground.copy(alpha = 0.84f))
                                     .padding(horizontal = 5.dp, vertical = 1.dp)
                             ) {
                                 Text(
-                                    text = "#${index + 1}",
+                                    text = if (labelTag != null) "#${index + 1} $labelTag" else "#${index + 1}",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = if (selected) CyanAccent else CrispWhite
                                 )

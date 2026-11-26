@@ -20,7 +20,7 @@ sealed class StackMode(
         id = "hdr_blend",
         title = "HDR Exposure Blend",
         subtitle = "Fuse bracketed exposures with natural highlight roll-off",
-        isAvailable = false
+        isAvailable = true
     )
 
     data object AstroNoiseStack : StackMode(
@@ -72,6 +72,13 @@ enum class FocusRegion(val label: String) {
     ANALYZING("...")
 }
 
+enum class ExposureBracket(val label: String) {
+    DARK("Dark"),
+    MID("Mid"),
+    BRIGHT("Bright"),
+    ANALYZING("...")
+}
+
 data class OutputSettings(
     val maxResolution: MaxResolutionPreset = MaxResolutionPreset.UHD_4K,
     val outputFormat: OutputFormat = OutputFormat.JPEG,
@@ -87,7 +94,13 @@ data class FocusStackConfig(
 )
 
 data class HdrConfig(
-    val toneMappingStrength: Float = 0.6f
+    val alignmentMode: AlignmentMode = AlignmentMode.AUTO_HOMOGRAPHY,
+    val contrastWeight: Float = 1.0f,
+    val saturationWeight: Float = 1.0f,
+    val exposureWeight: Float = 1.0f,
+    val deghostingEnabled: Boolean = false,
+    val autoCropBorders: Boolean = true,
+    val outputSettings: OutputSettings = OutputSettings()
 )
 
 data class AstroConfig(
@@ -104,6 +117,8 @@ data class StackFrame(
     val focusRegion: FocusRegion = FocusRegion.ANALYZING,
     val focusDistanceScore: Float = 0.5f,
     val peakSharpnessScore: Float = 0f,
+    val exposureBracket: ExposureBracket = ExposureBracket.ANALYZING,
+    val meanLuminance: Float = 0.5f,
     val isAnalyzed: Boolean = false
 )
 
@@ -120,6 +135,8 @@ data class StackResult(
     val alignedSourceCachePaths: List<String>,
     val referenceFrameUri: Uri?,
     val frameNames: List<String>,
+    val frameLabels: List<String> = emptyList(),
+    val stackMode: StackMode = StackMode.FocusStack,
     val defaultComparisonIndex: Int,
     val alignedFramesCount: Int,
     val processingTimeMs: Long,

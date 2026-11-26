@@ -10,6 +10,7 @@ import com.example.data.SettingsRepository
 import com.example.domain.model.AlignmentMode
 import com.example.domain.model.BlendAlgorithm
 import com.example.domain.model.FocusStackConfig
+import com.example.domain.model.HdrConfig
 import com.example.domain.model.MaxResolutionPreset
 import com.example.domain.model.OutputFormat
 import com.example.domain.model.OutputSettings
@@ -19,9 +20,11 @@ import com.example.domain.model.StackFrame
 import com.example.domain.model.StackMode
 import com.example.domain.model.StackProgress
 import com.example.domain.model.StackResult
+import com.example.engine.EvFrameAnalyzer
 import com.example.engine.FocusFrameAnalyzer
 import com.example.engine.FocusStackProcessor
 import com.example.engine.FrameBitmapLoader
+import com.example.engine.HdrStackProcessor
 import com.example.engine.RetouchAndPeakingUtils
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -62,6 +65,10 @@ data class StackLabUiState(
     val blendAlgorithm: BlendAlgorithm = BlendAlgorithm.PYRAMID_PMAX,
     val edgeSmoothingRadius: Int = 3,
     val autoCropBorders: Boolean = true,
+    val hdrContrastWeight: Float = 1.0f,
+    val hdrSaturationWeight: Float = 1.0f,
+    val hdrExposureWeight: Float = 1.0f,
+    val hdrDeghostingEnabled: Boolean = false,
     val processingState: ProcessingUiState = ProcessingUiState.Idle,
     val result: StackResult? = null,
     val retouchBitmapVersion: Int = 0,
@@ -94,7 +101,9 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     private val settingsRepository = SettingsRepository(application)
     private val bitmapLoader = FrameBitmapLoader(application)
     private val focusAnalyzer = FocusFrameAnalyzer(bitmapLoader)
+    private val evAnalyzer = EvFrameAnalyzer(bitmapLoader)
     private val focusStackProcessor = FocusStackProcessor(bitmapLoader)
+    private val hdrStackProcessor = HdrStackProcessor(bitmapLoader)
     private val mediaStoreExporter = MediaStoreExporter(application)
 
     private val _uiState = MutableStateFlow(StackLabUiState())
@@ -123,22 +132,48 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun onPhotosSelected(uris: List<Uri>, navigateToWorkspace: Boolean) {
+    fun openHdrWorkspace() {
+        analysisJob?.cancel()
+        val switchingFromOtherMode = _uiState.value.activeMode != StackMode.HdrExposureBlend
+        if (switchingFromOtherMode) {
+            clearRetouchAndPeakingState()
+            recycleResultBitmaps(_uiState.value.result)
+        }
+        _uiState.update { state ->
+            state.copy(
+                activeMode = StackMode.HdrExposureBlend,
+                frames = if (switchingFromOtherMode) emptyList() else state.frames,
+                selectedPreviewIndex = if (switchingFromOtherMode) 0 else state.selectedPreviewIndex,
+                result = if (switchingFromOtherMode) null else state.result,
+                lastSavedPath = null
+            )
+        }
+        _navEvents.tryEmit(StackLabNavEvent.OpenWorkspace)
+    }
+
+    fun onPhotosSelected(
+        uris: List<Uri>,
+        navigateToWorkspace: Boolean,
+        mode: StackMode? = null
+    ) {
         if (uris.isEmpty()) return
         viewModelScope.launch {
             val newFrames = withContext(Dispatchers.IO) {
                 bitmapLoader.inspectFrames(uris)
             }
             var mergedFrames: List<StackFrame> = emptyList()
+            var resolvedMode: StackMode = StackMode.FocusStack
             _uiState.update { state ->
+                val targetMode = mode ?: if (navigateToWorkspace) StackMode.FocusStack else state.activeMode
                 val merged = if (navigateToWorkspace) {
                     newFrames
                 } else {
                     state.frames + newFrames
                 }
                 mergedFrames = merged
+                resolvedMode = targetMode
                 state.copy(
-                    activeMode = StackMode.FocusStack,
+                    activeMode = targetMode,
                     frames = merged,
                     selectedPreviewIndex = state.selectedPreviewIndex.coerceIn(
                         0,
@@ -150,7 +185,11 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             if (navigateToWorkspace) {
                 _navEvents.tryEmit(StackLabNavEvent.OpenWorkspace)
             }
-            runFocusAnalysis(mergedFrames)
+            if (resolvedMode == StackMode.HdrExposureBlend) {
+                runEvAnalysis(mergedFrames, autoSort = true)
+            } else {
+                runFocusAnalysis(mergedFrames)
+            }
         }
     }
 
@@ -180,6 +219,53 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                                 current
                             }
                         }
+                    )
+                }
+            } catch (_: CancellationException) {
+                _uiState.update { it.copy(isAnalyzingFocus = false) }
+            } catch (_: Throwable) {
+                _uiState.update { it.copy(isAnalyzingFocus = false) }
+            }
+        }
+    }
+
+    private fun runEvAnalysis(framesToAnalyze: List<StackFrame>, autoSort: Boolean) {
+        if (framesToAnalyze.isEmpty()) return
+        analysisJob?.cancel()
+        analysisJob = viewModelScope.launch {
+            _uiState.update { it.copy(isAnalyzingFocus = true) }
+            try {
+                val analyzed = withContext(Dispatchers.Default) {
+                    evAnalyzer.analyzeFrames(framesToAnalyze)
+                }
+                val byId = analyzed.associateBy { it.id }
+                _uiState.update { state ->
+                    val selectedId = state.frames.getOrNull(state.selectedPreviewIndex)?.id
+                    val updatedList = state.frames.map { current ->
+                        val updated = byId[current.id]
+                        if (updated != null) {
+                            current.copy(
+                                exposureBracket = updated.exposureBracket,
+                                meanLuminance = updated.meanLuminance,
+                                isAnalyzed = true
+                            )
+                        } else {
+                            current
+                        }
+                    }
+                    val finalFrames = if (autoSort && updatedList.size >= 2) {
+                        updatedList.sortedBy { it.meanLuminance }
+                    } else {
+                        updatedList
+                    }
+                    val nextSelected = selectedId?.let { id ->
+                        finalFrames.indexOfFirst { it.id == id }.takeIf { it >= 0 }
+                    } ?: state.selectedPreviewIndex.coerceIn(0, (finalFrames.size - 1).coerceAtLeast(0))
+
+                    state.copy(
+                        isAnalyzingFocus = false,
+                        frames = finalFrames,
+                        selectedPreviewIndex = nextSelected
                     )
                 }
             } catch (_: CancellationException) {
@@ -221,6 +307,25 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun autoSortFramesByEv() {
+        val current = _uiState.value
+        if (current.frames.size < 2) return
+
+        val selectedId = current.frames.getOrNull(current.selectedPreviewIndex)?.id
+        val sorted = current.frames.sortedBy { it.meanLuminance }
+        val newSelectedIdx = selectedId?.let { id ->
+            sorted.indexOfFirst { it.id == id }.takeIf { it >= 0 }
+        } ?: 0
+
+        _uiState.update {
+            it.copy(
+                frames = sorted,
+                selectedPreviewIndex = newSelectedIdx,
+                snackbarMessage = "Brackets sorted Dark → Mid → Bright"
+            )
+        }
+    }
+
     fun selectPreviewFrame(index: Int) {
         _uiState.update { state ->
             if (state.frames.isEmpty()) state
@@ -235,9 +340,13 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             val nextPreview = if (updated.isEmpty()) 0 else state.selectedPreviewIndex.coerceAtMost(updated.lastIndex)
             state.copy(frames = updated, selectedPreviewIndex = nextPreview)
         }
-        val remaining = _uiState.value.frames
-        if (remaining.isNotEmpty()) {
-            runFocusAnalysis(remaining)
+        val stateAfter = _uiState.value
+        if (stateAfter.frames.isNotEmpty()) {
+            if (stateAfter.activeMode == StackMode.HdrExposureBlend) {
+                runEvAnalysis(stateAfter.frames, autoSort = false)
+            } else {
+                runFocusAnalysis(stateAfter.frames)
+            }
         }
     }
 
@@ -275,6 +384,22 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(autoCropBorders = enabled) }
     }
 
+    fun setHdrContrastWeight(weight: Float) {
+        _uiState.update { it.copy(hdrContrastWeight = weight.coerceIn(0f, 2f)) }
+    }
+
+    fun setHdrSaturationWeight(weight: Float) {
+        _uiState.update { it.copy(hdrSaturationWeight = weight.coerceIn(0f, 2f)) }
+    }
+
+    fun setHdrExposureWeight(weight: Float) {
+        _uiState.update { it.copy(hdrExposureWeight = weight.coerceIn(0f, 2f)) }
+    }
+
+    fun setHdrDeghostingEnabled(enabled: Boolean) {
+        _uiState.update { it.copy(hdrDeghostingEnabled = enabled) }
+    }
+
     fun updateMaxResolution(preset: MaxResolutionPreset) {
         viewModelScope.launch { settingsRepository.updateMaxResolution(preset) }
     }
@@ -288,43 +413,72 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun startFocusStacking() {
+        startStacking()
+    }
+
+    fun startStacking() {
         val current = _uiState.value
         val activeFrames = current.frames.filter { it.isEnabled }
         if (activeFrames.size < 2) {
-            postMessage("Enable at least 2 frames to build a focus stack.")
+            val noun = if (current.activeMode == StackMode.HdrExposureBlend) "bracketed frames" else "frames"
+            postMessage("Enable at least 2 $noun to process.")
             return
         }
         if (current.processingState is ProcessingUiState.Running) return
 
-        val config = FocusStackConfig(
-            alignmentMode = current.alignmentMode,
-            blendAlgorithm = current.blendAlgorithm,
-            edgeSmoothingRadius = current.edgeSmoothingRadius,
-            autoCropBorders = current.autoCropBorders,
-            outputSettings = current.outputSettings
-        )
-
         stackingJob?.cancel()
         stackingJob = viewModelScope.launch(Dispatchers.Default) {
+            val initMsg = if (current.activeMode == StackMode.HdrExposureBlend) {
+                "Initializing Mertens HDR exposure fusion..."
+            } else {
+                "Initializing OpenCV darkroom engine..."
+            }
             _uiState.update {
                 it.copy(
                     processingState = ProcessingUiState.Running(
-                        StackProgress(1, 4, 0.02f, "Initializing OpenCV darkroom engine...")
+                        StackProgress(1, 4, 0.02f, initMsg)
                     )
                 )
             }
             try {
-                val result = focusStackProcessor.process(
-                    frames = activeFrames,
-                    config = config,
-                    onProgress = { progress ->
-                        _uiState.update { state ->
-                            if (state.processingState is ProcessingUiState.Running) {
-                                state.copy(processingState = ProcessingUiState.Running(progress))
-                            } else state
-                        }
+                val onProgress: (StackProgress) -> Unit = { progress ->
+                    _uiState.update { state ->
+                        if (state.processingState is ProcessingUiState.Running) {
+                            state.copy(processingState = ProcessingUiState.Running(progress))
+                        } else state
                     }
-                )
+                }
+
+                val result = if (current.activeMode == StackMode.HdrExposureBlend) {
+                    val hdrConfig = HdrConfig(
+                        alignmentMode = current.alignmentMode,
+                        contrastWeight = current.hdrContrastWeight,
+                        saturationWeight = current.hdrSaturationWeight,
+                        exposureWeight = current.hdrExposureWeight,
+                        deghostingEnabled = current.hdrDeghostingEnabled,
+                        autoCropBorders = current.autoCropBorders,
+                        outputSettings = current.outputSettings
+                    )
+                    hdrStackProcessor.process(
+                        frames = activeFrames,
+                        config = hdrConfig,
+                        onProgress = onProgress
+                    )
+                } else {
+                    val focusConfig = FocusStackConfig(
+                        alignmentMode = current.alignmentMode,
+                        blendAlgorithm = current.blendAlgorithm,
+                        edgeSmoothingRadius = current.edgeSmoothingRadius,
+                        autoCropBorders = current.autoCropBorders,
+                        outputSettings = current.outputSettings
+                    )
+                    focusStackProcessor.process(
+                        frames = activeFrames,
+                        config = focusConfig,
+                        onProgress = onProgress
+                    )
+                }
+
                 clearRetouchAndPeakingState()
                 recycleResultBitmaps(_uiState.value.result)
                 baseOutputBitmap = result.outputBitmap.copy(Bitmap.Config.ARGB_8888, false)
@@ -335,7 +489,10 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                         processingState = ProcessingUiState.Idle,
                         result = result,
                         retouchBitmapVersion = 1,
-                        retouchSourceIndex = 0,
+                        retouchSourceIndex = result.defaultComparisonIndex.coerceIn(
+                            0,
+                            (result.sourcePreviewBitmaps.size - 1).coerceAtLeast(0)
+                        ),
                         lastSavedPath = null
                     )
                 }
