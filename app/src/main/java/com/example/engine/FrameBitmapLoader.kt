@@ -94,29 +94,35 @@ class FrameBitmapLoader(private val context: Context) {
             decoded.recycle()
         }
 
-        if (targetWidth != null && targetHeight != null &&
-            (orientedBitmap.width != targetWidth || orientedBitmap.height != targetHeight)
-        ) {
-            val scaled = Bitmap.createScaledBitmap(orientedBitmap, targetWidth, targetHeight, true)
-            if (scaled !== orientedBitmap) {
-                orientedBitmap.recycle()
-            }
-            orientedBitmap = scaled
-        } else if (maxEdgePx != null) {
-            val currentMax = max(orientedBitmap.width, orientedBitmap.height)
-            if (currentMax > maxEdgePx) {
-                val scale = maxEdgePx.toFloat() / currentMax.toFloat()
-                val newW = (orientedBitmap.width * scale).roundToInt().coerceAtLeast(1)
-                val newH = (orientedBitmap.height * scale).roundToInt().coerceAtLeast(1)
-                val scaled = Bitmap.createScaledBitmap(orientedBitmap, newW, newH, true)
+        try {
+            if (targetWidth != null && targetHeight != null &&
+                (orientedBitmap.width != targetWidth || orientedBitmap.height != targetHeight)
+            ) {
+                val scaled = Bitmap.createScaledBitmap(orientedBitmap, targetWidth, targetHeight, true)
                 if (scaled !== orientedBitmap) {
                     orientedBitmap.recycle()
                 }
                 orientedBitmap = scaled
+            } else if (maxEdgePx != null) {
+                val currentMax = max(orientedBitmap.width, orientedBitmap.height)
+                if (currentMax > maxEdgePx) {
+                    val scale = maxEdgePx.toFloat() / currentMax.toFloat()
+                    val newW = (orientedBitmap.width * scale).roundToInt().coerceAtLeast(1)
+                    val newH = (orientedBitmap.height * scale).roundToInt().coerceAtLeast(1)
+                    val scaled = Bitmap.createScaledBitmap(orientedBitmap, newW, newH, true)
+                    if (scaled !== orientedBitmap) {
+                        orientedBitmap.recycle()
+                    }
+                    orientedBitmap = scaled
+                }
             }
+            return orientedBitmap
+        } catch (t: Throwable) {
+            if (!orientedBitmap.isRecycled) {
+                orientedBitmap.recycle()
+            }
+            throw t
         }
-
-        return orientedBitmap
     }
 
     fun readOrientedDimensions(uri: Uri, maxEdgePx: Int? = null): Pair<Int, Int> {
@@ -165,7 +171,11 @@ class FrameBitmapLoader(private val context: Context) {
     }
 
     fun getRetouchRunDir(runId: String): java.io.File {
-        val root = java.io.File(context.cacheDir, "retouch_frames")
+        val legacyRoot = java.io.File(context.cacheDir, "retouch_frames")
+        if (legacyRoot.exists()) {
+            legacyRoot.deleteRecursively()
+        }
+        val root = java.io.File(context.cacheDir, RETOUCH_CACHE_DIR)
         if (root.exists()) {
             root.listFiles()?.forEach { child ->
                 if (child.name != runId) {
@@ -174,6 +184,14 @@ class FrameBitmapLoader(private val context: Context) {
             }
         }
         return java.io.File(root, runId).apply { mkdirs() }
+    }
+
+    fun clearRetouchCache() {
+        try {
+            java.io.File(context.cacheDir, RETOUCH_CACHE_DIR).takeIf { it.exists() }?.deleteRecursively()
+            java.io.File(context.cacheDir, "retouch_frames").takeIf { it.exists() }?.deleteRecursively()
+        } catch (_: Exception) {
+        }
     }
 
     fun createPreviewCopy(source: Bitmap, maxEdgePx: Int = 1080): Bitmap {
@@ -272,5 +290,6 @@ class FrameBitmapLoader(private val context: Context) {
 
     companion object {
         const val PROXY_MAX_EDGE_PX = 1600
+        const val RETOUCH_CACHE_DIR = "retouch_cache"
     }
 }

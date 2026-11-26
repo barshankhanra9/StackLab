@@ -14,10 +14,10 @@ import com.example.domain.model.StackFrame
 import com.example.domain.model.StackMode
 import com.example.domain.model.StackProgress
 import com.example.domain.model.StackResult
-import java.io.BufferedOutputStream
 import java.io.File
-import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.Locale
 import java.util.UUID
 import kotlin.coroutines.coroutineContext
@@ -82,28 +82,30 @@ class AstroStackProcessor(
         )
 
         val runDir = bitmapLoader.getRetouchRunDir(UUID.randomUUID().toString())
-        var masterDarkU8: Mat? = null
+        val previewCap = OpenCvAlignmentPipeline.previewMaxEdgeForFrameCount(lightCount)
+        var masterDarkF32: Mat? = null
         var masterDarkProxyGray: Mat? = null
         var fgMaskFloatFull: Mat? = null
         var fgMaskFloatCropped: Mat? = null
         var fgMaskProxyU8: Mat? = null
+        var completed = false
 
         val rawStripFiles = ArrayList<File>(lightCount)
         val preallocatedPreviews = arrayOfNulls<Bitmap>(lightCount)
         val preallocatedCachePaths = arrayOfNulls<String>(lightCount)
 
         try {
-            // Step 1: Master Dark Calibration (if Dark frames are supplied)
+            // Step 1: Master Dark Calibration in 32-bit float (if Dark frames are supplied)
             if (darkCount > 0) {
                 onProgress(
                     StackProgress(
                         currentStep = 1,
                         totalSteps = totalSteps,
                         fraction = 0.04f,
-                        message = "Integrating $darkCount dark frames into Master Dark..."
+                        message = "Integrating $darkCount dark frames into 32-bit Master Dark..."
                     )
                 )
-                masterDarkU8 = buildMasterDarkFrame(
+                masterDarkF32 = buildMasterDarkFrame(
                     darkFrames = darkFrames,
                     targetWidth = targetWidth,
                     targetHeight = targetHeight,
@@ -138,15 +140,21 @@ class AstroStackProcessor(
             val proxyW = (targetWidth * refProxyScale).roundToInt().coerceAtLeast(32)
             val proxyH = (targetHeight * refProxyScale).roundToInt().coerceAtLeast(32)
 
-            if (masterDarkU8 != null) {
-                val darkSmall = Mat()
+            if (masterDarkF32 != null) {
+                val darkSmallF32 = Mat()
+                val darkSmallU8 = Mat()
                 val darkGray = Mat()
                 try {
-                    Imgproc.resize(masterDarkU8, darkSmall, Size(proxyW.toDouble(), proxyH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
-                    Imgproc.cvtColor(darkSmall, darkGray, Imgproc.COLOR_BGR2GRAY)
+                    Imgproc.resize(masterDarkF32, darkSmallF32, Size(proxyW.toDouble(), proxyH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+                    darkSmallF32.convertTo(darkSmallU8, CvType.CV_8UC3)
+                    Imgproc.cvtColor(darkSmallU8, darkGray, Imgproc.COLOR_BGR2GRAY)
                     masterDarkProxyGray = darkGray
+                } catch (t: Throwable) {
+                    darkGray.release()
+                    throw t
                 } finally {
-                    darkSmall.release()
+                    darkSmallF32.release()
+                    darkSmallU8.release()
                 }
             }
 
@@ -159,6 +167,9 @@ class AstroStackProcessor(
                     Core.compare(fgSmall, Scalar(0.35), skyMask, Core.CMP_LT)
                     skyMask.convertTo(skyMaskU8, CvType.CV_8UC1)
                     fgMaskProxyU8 = skyMaskU8
+                } catch (t: Throwable) {
+                    skyMaskU8.release()
+                    throw t
                 } finally {
                     fgSmall.release()
                     skyMask.release()
@@ -202,9 +213,11 @@ class AstroStackProcessor(
             if (fgMaskFloatFull != null) {
                 fgMaskFloatCropped = if (wasAutoCropped) {
                     val sub = Mat(fgMaskFloatFull, cropRect)
-                    val cloned = sub.clone()
-                    sub.release()
-                    cloned
+                    try {
+                        sub.clone()
+                    } finally {
+                        sub.release()
+                    }
                 } else {
                     fgMaskFloatFull.clone()
                 }
@@ -212,7 +225,7 @@ class AstroStackProcessor(
                 fgMaskFloatFull = null
             }
 
-            // Step 3: Stream each Light frame -> Dark subtract -> Warp -> Freeze Ground blend -> Write tiled raw strip cache
+            // Step 3: Stream each Light frame in CV_32FC3 -> Dark subtract -> Warp -> Freeze Ground blend -> Write high-precision strip cache
             for (i in 0 until lightCount) {
                 coroutineContext.ensureActive()
                 val frac = 0.38f + 0.30f * ((i + 1).toFloat() / lightCount.toFloat())
@@ -225,99 +238,142 @@ class AstroStackProcessor(
                     )
                 )
 
+                var frameBitmap: Bitmap? = null
                 var rawBgr: Mat? = null
-                var calibratedBgr: Mat? = null
-                var alignedBgr: Mat? = null
-                var blendedBgr: Mat? = null
-                var finalBgr: Mat? = null
+                var rawF32: Mat? = null
+                var calibratedF32: Mat? = null
+                var alignedF32: Mat? = null
+                var blendedF32: Mat? = null
+                var finalF32: Mat? = null
+                var previewU8: Mat? = null
 
                 try {
-                    val frameBitmap = bitmapLoader.loadNormalizedBitmap(
+                    frameBitmap = bitmapLoader.loadNormalizedBitmap(
                         uri = lightFrames[i].uri,
                         targetWidth = targetWidth,
                         targetHeight = targetHeight
                     )
                     rawBgr = OpenCvAlignmentPipeline.bitmapToBgrMat(frameBitmap)
                     frameBitmap.recycle()
+                    frameBitmap = null
 
-                    calibratedBgr = if (masterDarkU8 != null) {
+                    val f32 = Mat()
+                    rawBgr.convertTo(f32, CvType.CV_32FC3)
+                    rawF32 = f32
+                    rawBgr.release()
+                    rawBgr = null
+
+                    calibratedF32 = if (masterDarkF32 != null) {
                         val sub = Mat()
-                        Core.subtract(rawBgr, masterDarkU8, sub)
-                        rawBgr.release()
-                        rawBgr = null
-                        sub
+                        try {
+                            Core.subtract(rawF32, masterDarkF32, sub)
+                            Core.max(sub, Scalar(0.0, 0.0, 0.0), sub)
+                            sub
+                        } catch (t: Throwable) {
+                            sub.release()
+                            throw t
+                        } finally {
+                            rawF32.release()
+                            rawF32 = null
+                        }
                     } else {
-                        val ref = rawBgr
-                        rawBgr = null
+                        val ref = rawF32
+                        rawF32 = null
                         ref
                     }
 
-                    alignedBgr = if (i == refIndex || alignment.transforms[i] is OpenCvAlignmentPipeline.FrameTransform.Identity) {
-                        calibratedBgr.clone()
+                    alignedF32 = if (i == refIndex || alignment.transforms[i] is OpenCvAlignmentPipeline.FrameTransform.Identity) {
+                        calibratedF32.clone()
                     } else {
                         OpenCvAlignmentPipeline.warpFullFrame(
-                            srcBgr = calibratedBgr,
+                            srcBgr = calibratedF32,
                             transform = alignment.transforms[i],
                             targetWidth = targetWidth,
                             targetHeight = targetHeight
                         )
                     }
 
-                    blendedBgr = if (fgMaskFloatCropped != null && i != refIndex) {
-                        blendForegroundAndSky(
-                            foregroundBgr = calibratedBgr,
-                            skyBgr = alignedBgr,
+                    blendedF32 = if (fgMaskFloatCropped != null && i != refIndex) {
+                        blendForegroundAndSkyFloat(
+                            foregroundF32 = calibratedF32,
+                            skyF32 = alignedF32,
                             fgMaskFloat = fgMaskFloatCropped
                         )
                     } else {
-                        val ref = alignedBgr
-                        alignedBgr = null
+                        val ref = alignedF32
+                        alignedF32 = null
                         ref
                     }
 
-                    calibratedBgr.release()
-                    calibratedBgr = null
-                    alignedBgr?.release()
-                    alignedBgr = null
+                    calibratedF32.release()
+                    calibratedF32 = null
+                    alignedF32?.release()
+                    alignedF32 = null
 
-                    finalBgr = if (wasAutoCropped) {
-                        val sub = Mat(blendedBgr, cropRect)
-                        val cloned = sub.clone()
-                        sub.release()
-                        blendedBgr.release()
-                        blendedBgr = null
-                        cloned
+                    finalF32 = if (wasAutoCropped) {
+                        val sub = Mat(blendedF32, cropRect)
+                        try {
+                            sub.clone()
+                        } finally {
+                            sub.release()
+                            blendedF32.release()
+                            blendedF32 = null
+                        }
                     } else {
-                        val ref = blendedBgr
-                        blendedBgr = null
+                        val ref = blendedF32
+                        blendedF32 = null
                         ref
+                    }
+
+                    // Convert temporary 8-bit preview & retouch cache copy
+                    val clampedPreview = Mat()
+                    val u8 = Mat()
+                    try {
+                        Core.min(finalF32, Scalar(255.0, 255.0, 255.0), clampedPreview)
+                        Core.max(clampedPreview, Scalar(0.0, 0.0, 0.0), clampedPreview)
+                        clampedPreview.convertTo(u8, CvType.CV_8UC3)
+                        previewU8 = u8
+                    } catch (t: Throwable) {
+                        u8.release()
+                        throw t
+                    } finally {
+                        clampedPreview.release()
                     }
 
                     val cacheFile = File(runDir, "aligned_$i.jpg")
-                    OpenCvAlignmentPipeline.saveMatAsJpeg(finalBgr, cacheFile, quality = 96)
+                    OpenCvAlignmentPipeline.saveMatAsJpeg(previewU8, cacheFile, quality = 97)
                     preallocatedCachePaths[i] = cacheFile.absolutePath
-                    preallocatedPreviews[i] = OpenCvAlignmentPipeline.createPreviewFromBgrMat(finalBgr)
+                    preallocatedPreviews[i] = OpenCvAlignmentPipeline.createPreviewFromBgrMat(
+                        previewU8,
+                        maxEdgePx = previewCap
+                    )
+                    previewU8.release()
+                    previewU8 = null
 
+                    coroutineContext.ensureActive()
                     val rawBinFile = File(runDir, "astro_raw_$i.bin")
-                    writeBgrMatBytes(finalBgr, rawBinFile)
+                    writeFloatMatAsU16Bytes(finalF32, rawBinFile)
                     rawStripFiles.add(rawBinFile)
                 } finally {
+                    if (frameBitmap != null && !frameBitmap.isRecycled) frameBitmap.recycle()
                     rawBgr?.release()
-                    calibratedBgr?.release()
-                    alignedBgr?.release()
-                    blendedBgr?.release()
-                    finalBgr?.release()
+                    rawF32?.release()
+                    calibratedF32?.release()
+                    alignedF32?.release()
+                    blendedF32?.release()
+                    finalF32?.release()
+                    previewU8?.release()
                 }
             }
 
             // Release calibration & mask buffers before tiled stacking
-            masterDarkU8?.release()
-            masterDarkU8 = null
+            masterDarkF32?.release()
+            masterDarkF32 = null
             fgMaskFloatCropped?.release()
             fgMaskFloatCropped = null
 
-            // Step 4: Memory-safe tiled/strip streaming accumulation
-            val outputBgr = stackTiledRawFiles(
+            // Step 4: Memory-safe 32-bit float (CV_32FC3) tiled/strip streaming accumulation
+            val outputFloatBgr = stackTiledRawFiles(
                 rawFiles = rawStripFiles,
                 width = outWidth,
                 height = outHeight,
@@ -327,15 +383,11 @@ class AstroStackProcessor(
                 onProgress = onProgress
             )
 
-            val outputRgba = Mat()
-            val outputBitmap: Bitmap
-            try {
-                Imgproc.cvtColor(outputBgr, outputRgba, Imgproc.COLOR_BGR2RGBA)
-                outputBitmap = Bitmap.createBitmap(outWidth, outHeight, Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(outputRgba, outputBitmap)
+            // Convert from CV_32FC3 to 8-bit Bitmap ONLY at the final output stage
+            val outputBitmap = try {
+                OpenCvAlignmentPipeline.floatBgrMatToBitmap(outputFloatBgr, scaleTo255 = 1.0)
             } finally {
-                outputRgba.release()
-                outputBgr.release()
+                outputFloatBgr.release()
             }
 
             val elapsedMs = System.currentTimeMillis() - startTimeMs
@@ -362,6 +414,7 @@ class AstroStackProcessor(
                 if (idx == refIndex) "REF" else "LIGHT"
             }
 
+            completed = true
             return StackResult(
                 outputBitmap = outputBitmap,
                 sourcePreviewBitmaps = preallocatedPreviews.map { it!! },
@@ -384,12 +437,19 @@ class AstroStackProcessor(
                 darkFramesUsed = darkCount
             )
         } finally {
-            masterDarkU8?.release()
+            masterDarkF32?.release()
             masterDarkProxyGray?.release()
             fgMaskFloatFull?.release()
             fgMaskFloatCropped?.release()
             fgMaskProxyU8?.release()
             rawStripFiles.forEach { it.delete() }
+            if (!completed) {
+                preallocatedPreviews.forEach { bmp ->
+                    if (bmp != null && !bmp.isRecycled) bmp.recycle()
+                }
+                runDir.deleteRecursively()
+            }
+            System.gc()
         }
     }
 
@@ -402,7 +462,6 @@ class AstroStackProcessor(
     ): Mat {
         val count = darkFrames.size
         val sumMat = Mat.zeros(targetHeight, targetWidth, CvType.CV_32FC3)
-        val masterU8 = Mat()
         try {
             for (i in 0 until count) {
                 coroutineContext.ensureActive()
@@ -415,27 +474,32 @@ class AstroStackProcessor(
                         message = "Averaging Dark frame ${i + 1} of $count..."
                     )
                 )
-                val bmp = bitmapLoader.loadNormalizedBitmap(
-                    uri = darkFrames[i].uri,
-                    targetWidth = targetWidth,
-                    targetHeight = targetHeight
-                )
-                val bgr = OpenCvAlignmentPipeline.bitmapToBgrMat(bmp)
-                bmp.recycle()
+                var bmp: Bitmap? = null
+                var bgr: Mat? = null
                 val f32 = Mat()
                 try {
+                    bmp = bitmapLoader.loadNormalizedBitmap(
+                        uri = darkFrames[i].uri,
+                        targetWidth = targetWidth,
+                        targetHeight = targetHeight
+                    )
+                    bgr = OpenCvAlignmentPipeline.bitmapToBgrMat(bmp)
+                    bmp.recycle()
+                    bmp = null
+
                     bgr.convertTo(f32, CvType.CV_32FC3)
                     Core.add(sumMat, f32, sumMat)
                 } finally {
-                    bgr.release()
+                    if (bmp != null && !bmp.isRecycled) bmp.recycle()
+                    bgr?.release()
                     f32.release()
                 }
             }
             Core.multiply(sumMat, Scalar(1.0 / count, 1.0 / count, 1.0 / count), sumMat)
-            sumMat.convertTo(masterU8, CvType.CV_8UC3)
-            return masterU8
-        } finally {
+            return sumMat
+        } catch (t: Throwable) {
             sumMat.release()
+            throw t
         }
     }
 
@@ -538,6 +602,7 @@ class AstroStackProcessor(
                     }
 
                     if (resolved == null) {
+                        coroutineContext.ensureActive()
                         // Handheld Low-Light or Star-Field fallback: Multi-scale ECC + boosted ORB
                         resolved = tryMultiScaleEccAffine(
                             srcBoosted = srcBoostedGray,
@@ -548,12 +613,27 @@ class AstroStackProcessor(
                             fullHeight = targetHeight
                         )
                         if (resolved == null) {
+                            coroutineContext.ensureActive()
                             if (refOrbKp == null || refOrbDesc == null) {
                                 val kp = MatOfKeyPoint()
                                 val desc = Mat()
-                                ORB.create(3000).detectAndCompute(refBoostedGray, skyOnlyMaskProxy ?: Mat(), kp, desc)
-                                refOrbKp = kp
-                                refOrbDesc = desc
+                                val emptyMask = if (skyOnlyMaskProxy == null) Mat() else null
+                                try {
+                                    ORB.create(3000).detectAndCompute(
+                                        refBoostedGray,
+                                        skyOnlyMaskProxy ?: emptyMask!!,
+                                        kp,
+                                        desc
+                                    )
+                                    refOrbKp = kp
+                                    refOrbDesc = desc
+                                } catch (t: Throwable) {
+                                    kp.release()
+                                    desc.release()
+                                    throw t
+                                } finally {
+                                    emptyMask?.release()
+                                }
                             }
                             resolved = tryBoostedOrbHomography(
                                 srcBoosted = srcBoostedGray,
@@ -616,26 +696,40 @@ class AstroStackProcessor(
         proxyH: Int,
         masterDarkProxyGray: Mat?
     ): Mat {
-        val bmp = bitmapLoader.loadNormalizedBitmap(
-            uri = frame.uri,
-            targetWidth = proxyW,
-            targetHeight = proxyH
-        )
-        val bgr = OpenCvAlignmentPipeline.bitmapToBgrMat(bmp)
-        bmp.recycle()
+        var bmp: Bitmap? = null
+        var bgr: Mat? = null
         val gray = Mat()
         return try {
+            bmp = bitmapLoader.loadNormalizedBitmap(
+                uri = frame.uri,
+                targetWidth = proxyW,
+                targetHeight = proxyH
+            )
+            bgr = OpenCvAlignmentPipeline.bitmapToBgrMat(bmp)
+            bmp.recycle()
+            bmp = null
+
             Imgproc.cvtColor(bgr, gray, Imgproc.COLOR_BGR2GRAY)
             if (masterDarkProxyGray != null) {
                 val cal = Mat()
-                Core.subtract(gray, masterDarkProxyGray, cal)
-                cal
+                try {
+                    Core.subtract(gray, masterDarkProxyGray, cal)
+                    cal
+                } catch (t: Throwable) {
+                    cal.release()
+                    throw t
+                } finally {
+                    gray.release()
+                }
             } else {
-                gray.clone()
+                gray
             }
-        } finally {
-            bgr.release()
+        } catch (t: Throwable) {
             gray.release()
+            throw t
+        } finally {
+            if (bmp != null && !bmp.isRecycled) bmp.recycle()
+            bgr?.release()
         }
     }
 
@@ -653,12 +747,14 @@ class AstroStackProcessor(
             gamma.convertTo(boostedU8, CvType.CV_8UC1, 255.0)
             val clahe = Imgproc.createCLAHE(3.2, Size(8.0, 8.0))
             clahe.apply(boostedU8, claheOut)
-            claheOut.clone()
+            claheOut
+        } catch (t: Throwable) {
+            claheOut.release()
+            throw t
         } finally {
             f32.release()
             gamma.release()
             boostedU8.release()
-            claheOut.release()
         }
     }
 
@@ -696,15 +792,21 @@ class AstroStackProcessor(
 
             if (skyMask != null) {
                 val maskF = Mat()
-                skyMask.convertTo(maskF, CvType.CV_32FC1, 1.0 / 255.0)
-                Core.multiply(starMap, maskF, starMap)
-                maskF.release()
+                try {
+                    skyMask.convertTo(maskF, CvType.CV_32FC1, 1.0 / 255.0)
+                    Core.multiply(starMap, maskF, starMap)
+                } finally {
+                    maskF.release()
+                }
             }
 
             Imgproc.GaussianBlur(starMap, smoothed, Size(3.0, 3.0), 0.8)
             val dilateK = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(7.0, 7.0))
-            Imgproc.dilate(smoothed, dilated, dilateK)
-            dilateK.release()
+            try {
+                Imgproc.dilate(smoothed, dilated, dilateK)
+            } finally {
+                dilateK.release()
+            }
 
             Core.compare(smoothed, dilated, peaksMask, Core.CMP_EQ)
             Core.meanStdDev(smoothed, meanMat, stdMat)
@@ -1016,12 +1118,17 @@ class AstroStackProcessor(
         if (refKp == null || refDesc == null || refDesc.empty()) return null
         val srcKp = MatOfKeyPoint()
         val srcDesc = Mat()
+        val emptyMask = if (skyMask == null) Mat() else null
+        val knnMatches = ArrayList<MatOfDMatch>()
+        var sPts: MatOfPoint2f? = null
+        var rPts: MatOfPoint2f? = null
+        var hMat: Mat? = null
+
         return try {
-            ORB.create(3000).detectAndCompute(srcBoosted, skyMask ?: Mat(), srcKp, srcDesc)
+            ORB.create(3000).detectAndCompute(srcBoosted, skyMask ?: emptyMask!!, srcKp, srcDesc)
             if (srcDesc.empty() || srcDesc.rows() < 10) return null
 
             val matcher = BFMatcher.create(Core.NORM_HAMMING, false)
-            val knnMatches = ArrayList<MatOfDMatch>()
             matcher.knnMatch(srcDesc, refDesc, knnMatches, 2)
 
             val good = ArrayList<DMatch>()
@@ -1032,23 +1139,20 @@ class AstroStackProcessor(
                 }
                 m.release()
             }
+            knnMatches.clear()
             if (good.size < 10) return null
 
             val sArr = srcKp.toArray()
             val rArr = refKp.toArray()
-            val sPts = MatOfPoint2f(*good.map { sArr[it.queryIdx].pt }.toTypedArray())
-            val rPts = MatOfPoint2f(*good.map { rArr[it.trainIdx].pt }.toTypedArray())
-            val hMat = Calib3d.findHomography(sPts, rPts, Calib3d.RANSAC, 4.0)
-            sPts.release()
-            rPts.release()
+            sPts = MatOfPoint2f(*good.map { sArr[it.queryIdx].pt }.toTypedArray())
+            rPts = MatOfPoint2f(*good.map { rArr[it.trainIdx].pt }.toTypedArray())
+            hMat = Calib3d.findHomography(sPts, rPts, Calib3d.RANSAC, 4.0)
             if (hMat.empty()) {
-                hMat.release()
                 return null
             }
 
             val hp = DoubleArray(9)
             hMat.get(0, 0, hp)
-            hMat.release()
 
             val h22 = if (abs(hp[8]) > 1e-9) hp[8] else 1.0
             val hFull = doubleArrayOf(
@@ -1073,6 +1177,11 @@ class AstroStackProcessor(
         } catch (_: Exception) {
             null
         } finally {
+            knnMatches.forEach { it.release() }
+            sPts?.release()
+            rPts?.release()
+            hMat?.release()
+            emptyMask?.release()
             srcKp.release()
             srcDesc.release()
         }
@@ -1097,44 +1206,47 @@ class AstroStackProcessor(
         val pW = (width * scale).roundToInt().coerceAtLeast(16)
         val pH = (height * scale).roundToInt().coerceAtLeast(16)
 
-        val bmp = Bitmap.createBitmap(pW, pH, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        canvas.drawColor(Color.BLACK)
-        val minDim = min(pW, pH).toFloat()
-
-        for (stroke in strokes) {
-            if (stroke.points.isEmpty()) continue
-            val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.WHITE
-                strokeCap = Paint.Cap.ROUND
-                strokeJoin = Paint.Join.ROUND
-            }
-            val diameter = (stroke.brushSizeFraction * minDim).coerceAtLeast(4f)
-            if (stroke.points.size == 1) {
-                paint.style = Paint.Style.FILL
-                val p0 = stroke.points[0]
-                canvas.drawCircle(p0.u * pW, p0.v * pH, diameter * 0.5f, paint)
-            } else {
-                paint.style = Paint.Style.STROKE
-                paint.strokeWidth = diameter
-                val path = Path()
-                stroke.points.forEachIndexed { idx, pt ->
-                    val x = pt.u.coerceIn(0f, 1f) * pW
-                    val y = pt.v.coerceIn(0f, 1f) * pH
-                    if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
-                }
-                canvas.drawPath(path, paint)
-            }
-        }
-
         val rgba = Mat()
         val gray = Mat()
         val floatMask = Mat()
         val blurred = Mat()
         val fullMask = Mat()
+        var bmp: Bitmap? = null
         return try {
+            bmp = Bitmap.createBitmap(pW, pH, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bmp)
+            canvas.drawColor(Color.BLACK)
+            val minDim = min(pW, pH).toFloat()
+
+            for (stroke in strokes) {
+                if (stroke.points.isEmpty()) continue
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE
+                    strokeCap = Paint.Cap.ROUND
+                    strokeJoin = Paint.Join.ROUND
+                }
+                val diameter = (stroke.brushSizeFraction * minDim).coerceAtLeast(4f)
+                if (stroke.points.size == 1) {
+                    paint.style = Paint.Style.FILL
+                    val p0 = stroke.points[0]
+                    canvas.drawCircle(p0.u * pW, p0.v * pH, diameter * 0.5f, paint)
+                } else {
+                    paint.style = Paint.Style.STROKE
+                    paint.strokeWidth = diameter
+                    val path = Path()
+                    stroke.points.forEachIndexed { idx, pt ->
+                        val x = pt.u.coerceIn(0f, 1f) * pW
+                        val y = pt.v.coerceIn(0f, 1f) * pH
+                        if (idx == 0) path.moveTo(x, y) else path.lineTo(x, y)
+                    }
+                    canvas.drawPath(path, paint)
+                }
+            }
+
             Utils.bitmapToMat(bmp, rgba)
             bmp.recycle()
+            bmp = null
+
             Imgproc.cvtColor(rgba, gray, Imgproc.COLOR_RGBA2GRAY)
             gray.convertTo(floatMask, CvType.CV_32FC1, 1.0 / 255.0)
             val blurSigma = (minDim * 0.014).coerceIn(3.0, 18.0)
@@ -1142,67 +1254,81 @@ class AstroStackProcessor(
             Imgproc.resize(blurred, fullMask, Size(width.toDouble(), height.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
             Core.min(fullMask, Scalar(1.0), fullMask)
             Core.max(fullMask, Scalar(0.0), fullMask)
-            fullMask.clone()
+            fullMask
+        } catch (t: Throwable) {
+            fullMask.release()
+            throw t
         } finally {
+            if (bmp != null && !bmp.isRecycled) bmp.recycle()
             rgba.release()
             gray.release()
             floatMask.release()
             blurred.release()
-            fullMask.release()
         }
     }
 
-    private fun blendForegroundAndSky(
-        foregroundBgr: Mat,
-        skyBgr: Mat,
+    private fun blendForegroundAndSkyFloat(
+        foregroundF32: Mat,
+        skyF32: Mat,
         fgMaskFloat: Mat
     ): Mat {
-        val fgF = Mat()
-        val skyF = Mat()
         val mask3 = Mat()
         val invMask3 = Mat()
         val termFg = Mat()
         val termSky = Mat()
         val blendedF = Mat()
-        val outU8 = Mat()
 
         return try {
-            foregroundBgr.convertTo(fgF, CvType.CV_32FC3)
-            skyBgr.convertTo(skyF, CvType.CV_32FC3)
             Imgproc.cvtColor(fgMaskFloat, mask3, Imgproc.COLOR_GRAY2BGR)
             Core.multiply(mask3, Scalar(-1.0, -1.0, -1.0), invMask3)
             Core.add(invMask3, Scalar(1.0, 1.0, 1.0), invMask3)
 
-            Core.multiply(fgF, mask3, termFg)
-            Core.multiply(skyF, invMask3, termSky)
+            Core.multiply(foregroundF32, mask3, termFg)
+            Core.multiply(skyF32, invMask3, termSky)
             Core.add(termFg, termSky, blendedF)
-            blendedF.convertTo(outU8, CvType.CV_8UC3)
-            outU8.clone()
+            blendedF
+        } catch (t: Throwable) {
+            blendedF.release()
+            throw t
         } finally {
-            fgF.release()
-            skyF.release()
             mask3.release()
             invMask3.release()
             termFg.release()
             termSky.release()
-            blendedF.release()
-            outU8.release()
         }
     }
 
-    private fun writeBgrMatBytes(bgrMat: Mat, file: File) {
-        val rows = bgrMat.rows()
-        val cols = bgrMat.cols()
+    private fun writeFloatMatAsU16Bytes(floatBgr: Mat, file: File) {
+        val rows = floatBgr.rows()
+        val cols = floatBgr.cols()
         val chunkRows = min(64, rows)
-        val buf = ByteArray(chunkRows * cols * 3)
-        BufferedOutputStream(FileOutputStream(file), 65536).use { out ->
+        val floatsPerRow = cols * 3
+        val floatBuf = FloatArray(chunkRows * floatsPerRow)
+        val shortBuf = ShortArray(chunkRows * floatsPerRow)
+        val byteBuf = ByteBuffer.allocate(chunkRows * floatsPerRow * 2).order(ByteOrder.nativeOrder())
+
+        RandomAccessFile(file, "rw").use { raf ->
+            val channel = raf.channel
             var r = 0
             while (r < rows) {
                 val count = min(chunkRows, rows - r)
-                val sub = bgrMat.rowRange(r, r + count)
-                sub.get(0, 0, buf)
-                sub.release()
-                out.write(buf, 0, count * cols * 3)
+                val floatsToWrite = count * floatsPerRow
+                val sub = floatBgr.rowRange(r, r + count)
+                try {
+                    sub.get(0, 0, floatBuf)
+                } finally {
+                    sub.release()
+                }
+                for (idx in 0 until floatsToWrite) {
+                    shortBuf[idx] = (floatBuf[idx] * 257.0f).roundToInt().coerceIn(0, 65535).toShort()
+                }
+                byteBuf.clear()
+                byteBuf.asShortBuffer().put(shortBuf, 0, floatsToWrite)
+                byteBuf.position(0)
+                byteBuf.limit(floatsToWrite * 2)
+                while (byteBuf.hasRemaining()) {
+                    channel.write(byteBuf)
+                }
                 r += count
             }
         }
@@ -1218,16 +1344,18 @@ class AstroStackProcessor(
         onProgress: (StackProgress) -> Unit
     ): Mat {
         val frameCount = rawFiles.size
-        val rowBytes = width * 3
+        val rowSamples = width * 3
+        val rowBytesU16 = rowSamples * 2
         val maxTotalStripBytes = 24 * 1024 * 1024 // 24 MB memory cap across all frames per strip
-        val stripRows = (maxTotalStripBytes / (frameCount * rowBytes).coerceAtLeast(1))
+        val stripRows = (maxTotalStripBytes / (frameCount * rowBytesU16).coerceAtLeast(1))
             .coerceIn(16, 256)
 
-        val outputBgr = Mat(height, width, CvType.CV_8UC3)
+        val outputFloatBgr = Mat(height, width, CvType.CV_32FC3)
         val rafs = rawFiles.map { RandomAccessFile(it, "r") }
-        val maxStripBufLen = stripRows * rowBytes
-        val stripBuffers = Array(frameCount) { ByteArray(maxStripBufLen) }
-        val outStripBuf = ByteArray(maxStripBufLen)
+        val maxSamplesPerStrip = stripRows * rowSamples
+        val stripReadByteBuf = ByteBuffer.allocate(maxSamplesPerStrip * 2).order(ByteOrder.nativeOrder())
+        val stripShortArrays = Array(frameCount) { ShortArray(maxSamplesPerStrip) }
+        val outFloatStrip = FloatArray(maxSamplesPerStrip)
         val sampleScratch = FloatArray(frameCount)
 
         try {
@@ -1235,8 +1363,9 @@ class AstroStackProcessor(
             while (y < height) {
                 coroutineContext.ensureActive()
                 val countRows = min(stripRows, height - y)
-                val bytesNeeded = countRows * rowBytes
-                val offset = y.toLong() * rowBytes.toLong()
+                val sampleCount = countRows * rowSamples
+                val bytesNeeded = sampleCount * 2
+                val offset = y.toLong() * rowBytesU16.toLong()
 
                 val frac = 0.69f + 0.29f * ((y + countRows).toFloat() / height.toFloat())
                 onProgress(
@@ -1244,38 +1373,46 @@ class AstroStackProcessor(
                         currentStep = 4,
                         totalSteps = totalSteps,
                         fraction = frac,
-                        message = "Stacking tile rows ${y + 1}–${y + countRows} of $height (${algorithm.label})..."
+                        message = "Stacking 32-bit float rows ${y + 1}–${y + countRows} of $height (${algorithm.label})..."
                     )
                 )
 
                 for (k in 0 until frameCount) {
                     val raf = rafs[k]
                     raf.seek(offset)
-                    var readTotal = 0
-                    while (readTotal < bytesNeeded) {
-                        val n = raf.read(stripBuffers[k], readTotal, bytesNeeded - readTotal)
-                        if (n <= 0) break
-                        readTotal += n
+                    stripReadByteBuf.clear()
+                    stripReadByteBuf.limit(bytesNeeded)
+                    val channel = raf.channel
+                    while (stripReadByteBuf.hasRemaining()) {
+                        if (channel.read(stripReadByteBuf) < 0) break
                     }
+                    stripReadByteBuf.flip()
+                    stripReadByteBuf.asShortBuffer().get(stripShortArrays[k], 0, sampleCount)
                 }
 
-                stackByteStrip(
-                    stripBuffers = stripBuffers,
-                    outStrip = outStripBuf,
-                    byteCount = bytesNeeded,
+                stackU16StripToFloat(
+                    stripBuffers = stripShortArrays,
+                    outFloatStrip = outFloatStrip,
+                    sampleCount = sampleCount,
                     frameCount = frameCount,
                     algorithm = algorithm,
                     kappa = kappa,
                     scratch = sampleScratch
                 )
 
-                val sub = outputBgr.rowRange(y, y + countRows)
-                sub.put(0, 0, outStripBuf.copyOfRange(0, bytesNeeded))
-                sub.release()
+                val sub = outputFloatBgr.rowRange(y, y + countRows)
+                try {
+                    sub.put(0, 0, outFloatStrip.copyOfRange(0, sampleCount))
+                } finally {
+                    sub.release()
+                }
 
                 y += countRows
             }
-            return outputBgr
+            return outputFloatBgr
+        } catch (t: Throwable) {
+            outputFloatBgr.release()
+            throw t
         } finally {
             rafs.forEach {
                 try {
@@ -1298,6 +1435,60 @@ class AstroStackProcessor(
             val lights = frames.filter { it.isEnabled && it.astroFrameType == AstroFrameType.LIGHT }
             if (lights.isEmpty()) return null
             return lights[resolveReferenceLightIndex(lights)].id
+        }
+
+        internal fun stackU16StripToFloat(
+            stripBuffers: Array<ShortArray>,
+            outFloatStrip: FloatArray,
+            sampleCount: Int,
+            frameCount: Int,
+            algorithm: AstroStackAlgorithm,
+            kappa: Float,
+            scratch: FloatArray
+        ) {
+            val inv257 = 1.0f / 257.0f
+            when (algorithm) {
+                AstroStackAlgorithm.MEAN -> {
+                    val invN = 1f / frameCount.toFloat()
+                    for (p in 0 until sampleCount) {
+                        var sum = 0f
+                        for (k in 0 until frameCount) {
+                            sum += (stripBuffers[k][p].toInt() and 0xFFFF) * inv257
+                        }
+                        outFloatStrip[p] = (sum * invN).coerceIn(0f, 255f)
+                    }
+                }
+
+                AstroStackAlgorithm.MAXIMUM_LIGHTEN -> {
+                    for (p in 0 until sampleCount) {
+                        var maxVal = 0f
+                        for (k in 0 until frameCount) {
+                            val v = (stripBuffers[k][p].toInt() and 0xFFFF) * inv257
+                            if (v > maxVal) maxVal = v
+                        }
+                        outFloatStrip[p] = maxVal.coerceIn(0f, 255f)
+                    }
+                }
+
+                AstroStackAlgorithm.MEDIAN -> {
+                    for (p in 0 until sampleCount) {
+                        for (k in 0 until frameCount) {
+                            scratch[k] = (stripBuffers[k][p].toInt() and 0xFFFF) * inv257
+                        }
+                        outFloatStrip[p] = computeMedian(scratch, frameCount).coerceIn(0f, 255f)
+                    }
+                }
+
+                AstroStackAlgorithm.KAPPA_SIGMA -> {
+                    for (p in 0 until sampleCount) {
+                        for (k in 0 until frameCount) {
+                            scratch[k] = (stripBuffers[k][p].toInt() and 0xFFFF) * inv257
+                        }
+                        outFloatStrip[p] = computeKappaSigmaClippedMean(scratch, frameCount, kappa)
+                            .coerceIn(0f, 255f)
+                    }
+                }
+            }
         }
 
         internal fun stackByteStrip(

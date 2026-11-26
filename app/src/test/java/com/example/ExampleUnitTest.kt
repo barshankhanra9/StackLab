@@ -153,6 +153,57 @@ class ExampleUnitTest {
     }
 
     @Test
+    fun `astro u16 strip stacking preserves 32-bit float sub-integer precision`() {
+        // Channel 0 has sub-integer fractional signal (10.5 -> ~2698 in U16) + 240.0 outlier;
+        // Channel 1 has two values 100.0 and 101.0 -> exact 100.5 mean without 8-bit banding.
+        val buffers = arrayOf(
+            shortArrayOf((10.5f * 257f).toInt().toShort(), (100f * 257f).toInt().toShort()),
+            shortArrayOf((10.5f * 257f).toInt().toShort(), (101f * 257f).toInt().toShort()),
+            shortArrayOf((10.5f * 257f).toInt().toShort(), (100f * 257f).toInt().toShort()),
+            shortArrayOf((10.5f * 257f).toInt().toShort(), (101f * 257f).toInt().toShort()),
+            shortArrayOf((240f * 257f).toInt().toShort(), (100.5f * 257f).toInt().toShort())
+        )
+        val outFloat = FloatArray(2)
+        val scratch = FloatArray(buffers.size)
+
+        AstroStackProcessor.stackU16StripToFloat(
+            stripBuffers = buffers,
+            outFloatStrip = outFloat,
+            sampleCount = 2,
+            frameCount = buffers.size,
+            algorithm = AstroStackAlgorithm.KAPPA_SIGMA,
+            kappa = 2.5f,
+            scratch = scratch
+        )
+        assertEquals(10.5f, outFloat[0], 0.05f)
+        assertEquals(100.5f, outFloat[1], 0.05f)
+
+        AstroStackProcessor.stackU16StripToFloat(
+            stripBuffers = buffers,
+            outFloatStrip = outFloat,
+            sampleCount = 2,
+            frameCount = buffers.size,
+            algorithm = AstroStackAlgorithm.MEDIAN,
+            kappa = 2.5f,
+            scratch = scratch
+        )
+        assertEquals(10.5f, outFloat[0], 0.05f)
+        assertEquals(100.5f, outFloat[1], 0.05f)
+
+        AstroStackProcessor.stackU16StripToFloat(
+            stripBuffers = buffers,
+            outFloatStrip = outFloat,
+            sampleCount = 2,
+            frameCount = buffers.size,
+            algorithm = AstroStackAlgorithm.MAXIMUM_LIGHTEN,
+            kappa = 2.5f,
+            scratch = scratch
+        )
+        assertEquals(240f, outFloat[0], 0.05f)
+        assertEquals(101f, outFloat[1], 0.05f)
+    }
+
+    @Test
     fun `hdr style presets expose all four profiles with distinct weights and tone defaults`() {
         assertEquals(4, HdrStylePreset.entries.size)
         assertEquals("Natural", HdrStylePreset.NATURAL.label)

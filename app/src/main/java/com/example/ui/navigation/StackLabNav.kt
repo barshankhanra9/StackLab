@@ -1,15 +1,22 @@
 package com.example.ui.navigation
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
+import android.view.WindowManager
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.example.ui.ProcessingUiState
 import com.example.ui.StackLabNavEvent
 import com.example.ui.StackLabViewModel
 import com.example.ui.screens.HomeScreen
@@ -32,6 +39,20 @@ fun StackLabNav(
 ) {
     val navController = rememberNavController()
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val isStacking = uiState.processingState is ProcessingUiState.Running
+
+    DisposableEffect(isStacking, context) {
+        val window = context.findActivity()?.window
+        if (isStacking) {
+            window?.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            if (isStacking) {
+                window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            }
+        }
+    }
 
     LaunchedEffect(viewModel) {
         viewModel.navEvents.collect { event ->
@@ -125,8 +146,12 @@ fun StackLabNav(
         composable<ResultRoute> {
             ResultScreen(
                 uiState = uiState,
-                onNavigateBack = { navController.popBackStack() },
+                onNavigateBack = {
+                    viewModel.onExitResultScreen()
+                    navController.popBackStack()
+                },
                 onSaveFullRes = viewModel::saveFullResolutionResult,
+                onSelectOutputFormat = viewModel::updateOutputFormat,
                 onNewStack = viewModel::startNewStack,
                 onToggleFocusPeaking = viewModel::toggleFocusPeaking,
                 onCompareFrameChanged = viewModel::updateComparePeakingIfEnabled,
@@ -146,4 +171,10 @@ fun StackLabNav(
             )
         }
     }
+}
+
+private tailrec fun Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
 }

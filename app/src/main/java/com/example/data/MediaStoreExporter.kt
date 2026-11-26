@@ -62,6 +62,8 @@ class MediaStoreExporter(private val context: Context) {
                 val contentValues = ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
                     put(MediaStore.Images.Media.MIME_TYPE, settings.outputFormat.mimeType)
+                    put(MediaStore.Images.Media.WIDTH, bitmap.width)
+                    put(MediaStore.Images.Media.HEIGHT, bitmap.height)
                     put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/StackLab")
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }

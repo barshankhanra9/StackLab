@@ -104,12 +104,14 @@ class HdrStackProcessor(
         val runDir = bitmapLoader.getRetouchRunDir(UUID.randomUUID().toString())
         val preallocatedPreviews = arrayOfNulls<Bitmap>(frameCount)
         val preallocatedCachePaths = arrayOfNulls<String>(frameCount)
+        val previewCap = OpenCvAlignmentPipeline.previewMaxEdgeForFrameCount(frameCount)
         val weightFiles = arrayOfNulls<File>(frameCount)
 
         val weightSum = Mat.zeros(outHeight, outWidth, CvType.CV_32FC1)
         var refGrayU8: Mat? = null
         var refGrayBlur: Mat? = null
         var refCdf: FloatArray? = null
+        var completed = false
 
         val pyramidLevels = OpenCvAlignmentPipeline.computePyramidLevels(outWidth, outHeight)
         val fusedPyramid = ArrayList<Mat>(pyramidLevels)
@@ -130,20 +132,23 @@ class HdrStackProcessor(
                     )
                 )
 
+                var frameBitmap: Bitmap? = null
                 var rawBgr: Mat? = null
                 var alignedBgr: Mat? = null
                 var croppedBgr: Mat? = null
+                var unsmoothedWeight: Mat? = null
                 var rawWeight: Mat? = null
                 var deghostMask: Mat? = null
 
                 try {
-                    val frameBitmap = bitmapLoader.loadNormalizedBitmap(
+                    frameBitmap = bitmapLoader.loadNormalizedBitmap(
                         uri = frames[frameIdx].uri,
                         targetWidth = targetWidth,
                         targetHeight = targetHeight
                     )
                     rawBgr = OpenCvAlignmentPipeline.bitmapToBgrMat(frameBitmap)
                     frameBitmap.recycle()
+                    frameBitmap = null
 
                     alignedBgr = OpenCvAlignmentPipeline.warpFullFrame(
                         rawBgr,
@@ -158,11 +163,13 @@ class HdrStackProcessor(
 
                     croppedBgr = if (wasAutoCropped) {
                         val sub = Mat(alignedBgr, cropRect)
-                        val cloned = sub.clone()
-                        sub.release()
-                        alignedBgr.release()
-                        alignedBgr = null
-                        cloned
+                        try {
+                            sub.clone()
+                        } finally {
+                            sub.release()
+                            alignedBgr.release()
+                            alignedBgr = null
+                        }
                     } else {
                         val ref = alignedBgr
                         alignedBgr = null
@@ -173,9 +180,13 @@ class HdrStackProcessor(
                     val cacheFile = File(runDir, "aligned_$frameIdx.jpg")
                     OpenCvAlignmentPipeline.saveMatAsJpeg(croppedBgr, cacheFile, quality = 97)
                     preallocatedCachePaths[frameIdx] = cacheFile.absolutePath
-                    preallocatedPreviews[frameIdx] = OpenCvAlignmentPipeline.createPreviewFromBgrMat(croppedBgr)
+                    preallocatedPreviews[frameIdx] = OpenCvAlignmentPipeline.createPreviewFromBgrMat(
+                        croppedBgr,
+                        maxEdgePx = previewCap
+                    )
 
-                    val unsmoothedWeight = computeMertensWeightMap(
+                    coroutineContext.ensureActive()
+                    unsmoothedWeight = computeMertensWeightMap(
                         bgrMat = croppedBgr,
                         contrastWeight = config.contrastWeight,
                         saturationWeight = config.saturationWeight,
@@ -183,16 +194,23 @@ class HdrStackProcessor(
                     )
                     rawWeight = smoothWeightMapMultiScale(unsmoothedWeight)
                     unsmoothedWeight.release()
+                    unsmoothedWeight = null
 
                     if (config.deghostingEnabled) {
                         if (stepIdx == 0) {
                             val refG = Mat()
-                            Imgproc.cvtColor(croppedBgr, refG, Imgproc.COLOR_BGR2GRAY)
                             val refB = Mat()
-                            Imgproc.GaussianBlur(refG, refB, Size(7.0, 7.0), 0.0)
-                            refCdf = computeGrayscaleCdf(refG)
-                            refGrayU8 = refG
-                            refGrayBlur = refB
+                            try {
+                                Imgproc.cvtColor(croppedBgr, refG, Imgproc.COLOR_BGR2GRAY)
+                                Imgproc.GaussianBlur(refG, refB, Size(7.0, 7.0), 0.0)
+                                refCdf = computeGrayscaleCdf(refG)
+                                refGrayU8 = refG
+                                refGrayBlur = refB
+                            } catch (t: Throwable) {
+                                refG.release()
+                                refB.release()
+                                throw t
+                            }
                         } else {
                             val rGray = refGrayU8
                             val rBlur = refGrayBlur
@@ -214,9 +232,11 @@ class HdrStackProcessor(
                     writeFloatMatToFile(rawWeight, wFile)
                     weightFiles[frameIdx] = wFile
                 } finally {
+                    if (frameBitmap != null && !frameBitmap.isRecycled) frameBitmap.recycle()
                     rawBgr?.release()
                     alignedBgr?.release()
                     croppedBgr?.release()
+                    unsmoothedWeight?.release()
                     rawWeight?.release()
                     deghostMask?.release()
                 }
@@ -259,12 +279,18 @@ class HdrStackProcessor(
                     alignedBgr = Imgcodecs.imread(cachePath)
                     if (alignedBgr.empty()) {
                         alignedBgr.release()
-                        val bmp = bitmapLoader.loadCachedBitmap(cachePath)
-                            ?: throw IllegalStateException("Unable to reload cached frame $frameIdx")
-                        alignedBgr = OpenCvAlignmentPipeline.bitmapToBgrMat(bmp)
-                        bmp.recycle()
+                        alignedBgr = null
+                        var bmp: Bitmap? = null
+                        try {
+                            bmp = bitmapLoader.loadCachedBitmap(cachePath)
+                                ?: throw IllegalStateException("Unable to reload cached frame $frameIdx")
+                            alignedBgr = OpenCvAlignmentPipeline.bitmapToBgrMat(bmp)
+                        } finally {
+                            if (bmp != null && !bmp.isRecycled) bmp.recycle()
+                        }
                     }
 
+                    coroutineContext.ensureActive()
                     rawWeight = readFloatMatFromFile(wFile, outWidth, outHeight)
                     wFile.delete()
 
@@ -284,16 +310,22 @@ class HdrStackProcessor(
                     val init = fusedPyramid.isEmpty()
                     for (level in 0 until pyramidLevels) {
                         val w3ch = Mat()
-                        Imgproc.cvtColor(weightGauss[level], w3ch, Imgproc.COLOR_GRAY2BGR)
                         val weighted = Mat()
-                        Core.multiply(imgLap[level], w3ch, weighted)
-                        w3ch.release()
+                        try {
+                            Imgproc.cvtColor(weightGauss[level], w3ch, Imgproc.COLOR_GRAY2BGR)
+                            Core.multiply(imgLap[level], w3ch, weighted)
 
-                        if (init) {
-                            fusedPyramid.add(weighted)
-                        } else {
-                            Core.add(fusedPyramid[level], weighted, fusedPyramid[level])
+                            if (init) {
+                                fusedPyramid.add(weighted)
+                            } else {
+                                Core.add(fusedPyramid[level], weighted, fusedPyramid[level])
+                                weighted.release()
+                            }
+                        } catch (t: Throwable) {
                             weighted.release()
+                            throw t
+                        } finally {
+                            w3ch.release()
                         }
                     }
                 } finally {
@@ -321,8 +353,11 @@ class HdrStackProcessor(
             fusedPyramid.forEach { it.release() }
             fusedPyramid.clear()
 
-            val outputBitmap = OpenCvAlignmentPipeline.floatBgrMatToBitmap(reconstructedFloat)
-            reconstructedFloat.release()
+            val outputBitmap = try {
+                OpenCvAlignmentPipeline.floatBgrMatToBitmap(reconstructedFloat)
+            } finally {
+                reconstructedFloat.release()
+            }
 
             val elapsedMs = System.currentTimeMillis() - startTimeMs
             val deghostSuffix = if (config.deghostingEnabled) " • Anchor #${refIndex + 1} Deghost" else ""
@@ -336,6 +371,7 @@ class HdrStackProcessor(
                 )
             )
 
+            completed = true
             return StackResult(
                 outputBitmap = outputBitmap,
                 sourcePreviewBitmaps = preallocatedPreviews.map { it!! },
@@ -361,6 +397,13 @@ class HdrStackProcessor(
             refGrayBlur?.release()
             fusedPyramid.forEach { it.release() }
             weightFiles.forEach { it?.delete() }
+            if (!completed) {
+                preallocatedPreviews.forEach { bmp ->
+                    if (bmp != null && !bmp.isRecycled) bmp.recycle()
+                }
+                runDir.deleteRecursively()
+            }
+            System.gc()
         }
     }
 
@@ -468,10 +511,12 @@ class HdrStackProcessor(
             }
 
             Core.add(weight, Scalar(1e-6), weight)
-            return weight.clone()
+            return weight
+        } catch (t: Throwable) {
+            weight.release()
+            throw t
         } finally {
             floatBgr.release()
-            weight.release()
         }
     }
 
@@ -518,14 +563,16 @@ class HdrStackProcessor(
             Core.addWeighted(scaleFine, 0.25, scaleMed, 0.40, 0.0, blended)
             Core.addWeighted(blended, 1.0, scaleBroad, 0.35, 0.0, blended)
             Core.max(blended, Scalar(1e-6), blended)
-            blended.clone()
+            blended
+        } catch (t: Throwable) {
+            blended.release()
+            throw t
         } finally {
             scaleFine.release()
             scaleMed.release()
             down4.release()
             down4Blur.release()
             scaleBroad.release()
-            blended.release()
         }
     }
 
@@ -576,7 +623,10 @@ class HdrStackProcessor(
 
             Imgproc.GaussianBlur(diffF, mask, Size(15.0, 15.0), 0.0)
             Core.max(mask, Scalar(1e-4), mask)
-            mask.clone()
+            mask
+        } catch (t: Throwable) {
+            mask.release()
+            throw t
         } finally {
             srcGray.release()
             lutMat.release()
@@ -589,7 +639,6 @@ class HdrStackProcessor(
             dilatedDiff.release()
             dilateKernel.release()
             diffF.release()
-            mask.release()
         }
     }
 
@@ -604,11 +653,14 @@ class HdrStackProcessor(
         while (r < rows) {
             val countRows = min(rowChunk, rows - r)
             val sub = grayU8.rowRange(r, r + countRows)
-            val needed = countRows * cols
-            sub.get(0, 0, buf)
-            sub.release()
-            for (i in 0 until needed) {
-                hist[buf[i].toInt() and 0xFF]++
+            try {
+                val needed = countRows * cols
+                sub.get(0, 0, buf)
+                for (i in 0 until needed) {
+                    hist[buf[i].toInt() and 0xFF]++
+                }
+            } finally {
+                sub.release()
             }
             r += countRows
         }
@@ -655,8 +707,11 @@ class HdrStackProcessor(
                 val count = min(chunkRows, rows - r)
                 val floatsToWrite = count * cols
                 val sub = mat.rowRange(r, r + count)
-                sub.get(0, 0, floatBuf)
-                sub.release()
+                try {
+                    sub.get(0, 0, floatBuf)
+                } finally {
+                    sub.release()
+                }
 
                 byteBuf.clear()
                 byteBuf.asFloatBuffer().put(floatBuf, 0, floatsToWrite)
@@ -676,26 +731,34 @@ class HdrStackProcessor(
         val floatBuf = FloatArray(chunkRows * cols)
         val byteBuf = ByteBuffer.allocate(chunkRows * cols * 4).order(ByteOrder.nativeOrder())
 
-        RandomAccessFile(file, "r").use { raf ->
-            val channel = raf.channel
-            var r = 0
-            while (r < rows) {
-                val count = min(chunkRows, rows - r)
-                val floatsToRead = count * cols
-                byteBuf.clear()
-                byteBuf.limit(floatsToRead * 4)
-                while (byteBuf.hasRemaining()) {
-                    if (channel.read(byteBuf) < 0) break
-                }
-                byteBuf.flip()
-                byteBuf.asFloatBuffer().get(floatBuf, 0, floatsToRead)
+        try {
+            RandomAccessFile(file, "r").use { raf ->
+                val channel = raf.channel
+                var r = 0
+                while (r < rows) {
+                    val count = min(chunkRows, rows - r)
+                    val floatsToRead = count * cols
+                    byteBuf.clear()
+                    byteBuf.limit(floatsToRead * 4)
+                    while (byteBuf.hasRemaining()) {
+                        if (channel.read(byteBuf) < 0) break
+                    }
+                    byteBuf.flip()
+                    byteBuf.asFloatBuffer().get(floatBuf, 0, floatsToRead)
 
-                val sub = mat.rowRange(r, r + count)
-                sub.put(0, 0, floatBuf)
-                sub.release()
-                r += count
+                    val sub = mat.rowRange(r, r + count)
+                    try {
+                        sub.put(0, 0, floatBuf)
+                    } finally {
+                        sub.release()
+                    }
+                    r += count
+                }
             }
+            return mat
+        } catch (t: Throwable) {
+            mat.release()
+            throw t
         }
-        return mat
     }
 }

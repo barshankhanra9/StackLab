@@ -70,6 +70,12 @@ internal object OpenCvAlignmentPipeline {
         val alignmentNote: String
     )
 
+    fun previewMaxEdgeForFrameCount(frameCount: Int): Int = when {
+        frameCount > 24 -> 512
+        frameCount > 12 -> 720
+        else -> PREVIEW_MAX_EDGE_PX
+    }
+
     suspend fun alignFramesOnProxy(
         bitmapLoader: FrameBitmapLoader,
         frames: List<StackFrame>,
@@ -94,16 +100,29 @@ internal object OpenCvAlignmentPipeline {
             var refDescriptors1024: Mat? = null
 
             try {
-                val refProxyBmp = bitmapLoader.loadNormalizedBitmap(
-                    uri = frames[refIndex].uri,
-                    maxEdgePx = ALIGN_PROXY_MAX_EDGE_PX
-                )
-                val refProxyBgr = bitmapToBgrMat(refProxyBmp)
-                refProxyBmp.recycle()
+                var refProxyBmp: Bitmap? = null
+                var refProxyBgr: Mat? = null
+                try {
+                    refProxyBmp = bitmapLoader.loadNormalizedBitmap(
+                        uri = frames[refIndex].uri,
+                        maxEdgePx = ALIGN_PROXY_MAX_EDGE_PX
+                    )
+                    refProxyBgr = bitmapToBgrMat(refProxyBmp)
+                    refProxyBmp.recycle()
+                    refProxyBmp = null
 
-                refGray1024 = Mat()
-                Imgproc.cvtColor(refProxyBgr, refGray1024, Imgproc.COLOR_BGR2GRAY)
-                refProxyBgr.release()
+                    val gray = Mat()
+                    try {
+                        Imgproc.cvtColor(refProxyBgr, gray, Imgproc.COLOR_BGR2GRAY)
+                        refGray1024 = gray
+                    } catch (t: Throwable) {
+                        gray.release()
+                        throw t
+                    }
+                } finally {
+                    if (refProxyBmp != null && !refProxyBmp.isRecycled) refProxyBmp.recycle()
+                    refProxyBgr?.release()
+                }
 
                 val proxyW = refGray1024.cols()
                 val proxyH = refGray1024.rows()
@@ -126,19 +145,32 @@ internal object OpenCvAlignmentPipeline {
                         )
                     )
 
-                    val srcProxyBmp = bitmapLoader.loadNormalizedBitmap(
-                        uri = frames[i].uri,
-                        targetWidth = proxyW,
-                        targetHeight = proxyH
-                    )
-                    val srcProxyBgr = bitmapToBgrMat(srcProxyBmp)
-                    srcProxyBmp.recycle()
-
-                    val srcGray1024 = Mat()
-                    Imgproc.cvtColor(srcProxyBgr, srcGray1024, Imgproc.COLOR_BGR2GRAY)
-                    srcProxyBgr.release()
+                    var srcProxyBmp: Bitmap? = null
+                    var srcProxyBgr: Mat? = null
+                    var srcGray1024: Mat? = null
 
                     try {
+                        srcProxyBmp = bitmapLoader.loadNormalizedBitmap(
+                            uri = frames[i].uri,
+                            targetWidth = proxyW,
+                            targetHeight = proxyH
+                        )
+                        srcProxyBgr = bitmapToBgrMat(srcProxyBmp)
+                        srcProxyBmp.recycle()
+                        srcProxyBmp = null
+
+                        val gray = Mat()
+                        try {
+                            Imgproc.cvtColor(srcProxyBgr, gray, Imgproc.COLOR_BGR2GRAY)
+                            srcGray1024 = gray
+                        } catch (t: Throwable) {
+                            gray.release()
+                            throw t
+                        }
+                        srcProxyBgr.release()
+                        srcProxyBgr = null
+
+                        coroutineContext.ensureActive()
                         val eccAffine = tryEccAffineOnProxy(
                             srcGray = srcGray1024,
                             refGray = refGray1024,
@@ -152,12 +184,22 @@ internal object OpenCvAlignmentPipeline {
                             alignedCount++
                             eccSuccessCount++
                         } else {
+                            coroutineContext.ensureActive()
                             if (refKeypoints1024 == null || refDescriptors1024 == null) {
                                 val kp = MatOfKeyPoint()
                                 val desc = Mat()
-                                ORB.create(2000).detectAndCompute(refGray1024, Mat(), kp, desc)
-                                refKeypoints1024 = kp
-                                refDescriptors1024 = desc
+                                val emptyMask = Mat()
+                                try {
+                                    ORB.create(2000).detectAndCompute(refGray1024, emptyMask, kp, desc)
+                                    refKeypoints1024 = kp
+                                    refDescriptors1024 = desc
+                                } catch (t: Throwable) {
+                                    kp.release()
+                                    desc.release()
+                                    throw t
+                                } finally {
+                                    emptyMask.release()
+                                }
                             }
                             val orbHomography = tryOrbHomographyOnProxy(
                                 srcGray = srcGray1024,
@@ -177,7 +219,9 @@ internal object OpenCvAlignmentPipeline {
                             }
                         }
                     } finally {
-                        srcGray1024.release()
+                        if (srcProxyBmp != null && !srcProxyBmp.isRecycled) srcProxyBmp.recycle()
+                        srcProxyBgr?.release()
+                        srcGray1024?.release()
                     }
                 }
             } finally {
@@ -269,13 +313,17 @@ internal object OpenCvAlignmentPipeline {
         if (refKeypoints == null || refDescriptors == null || refDescriptors.empty()) return null
         val srcKeypoints = MatOfKeyPoint()
         val srcDescriptors = Mat()
+        val emptyMask = Mat()
+        val knnMatches = ArrayList<MatOfDMatch>()
+        var srcPts: MatOfPoint2f? = null
+        var dstPts: MatOfPoint2f? = null
+        var homographyProxy: Mat? = null
 
         return try {
-            ORB.create(2000).detectAndCompute(srcGray, Mat(), srcKeypoints, srcDescriptors)
+            ORB.create(2000).detectAndCompute(srcGray, emptyMask, srcKeypoints, srcDescriptors)
             if (srcDescriptors.empty() || srcDescriptors.rows() < 12) return null
 
             val matcher = BFMatcher.create(Core.NORM_HAMMING, false)
-            val knnMatches = ArrayList<MatOfDMatch>()
             matcher.knnMatch(srcDescriptors, refDescriptors, knnMatches, 2)
 
             val goodMatches = ArrayList<DMatch>()
@@ -286,6 +334,7 @@ internal object OpenCvAlignmentPipeline {
                 }
                 matOfDMatch.release()
             }
+            knnMatches.clear()
 
             if (goodMatches.size < 12) return null
 
@@ -298,20 +347,16 @@ internal object OpenCvAlignmentPipeline {
                 dstPtsList.add(refKpArray[m.trainIdx].pt)
             }
 
-            val srcPts = MatOfPoint2f(*srcPtsList.toTypedArray())
-            val dstPts = MatOfPoint2f(*dstPtsList.toTypedArray())
-            val homographyProxy = Calib3d.findHomography(srcPts, dstPts, Calib3d.RANSAC, 4.0)
-            srcPts.release()
-            dstPts.release()
+            srcPts = MatOfPoint2f(*srcPtsList.toTypedArray())
+            dstPts = MatOfPoint2f(*dstPtsList.toTypedArray())
+            homographyProxy = Calib3d.findHomography(srcPts, dstPts, Calib3d.RANSAC, 4.0)
 
             if (homographyProxy.empty()) {
-                homographyProxy.release()
                 return null
             }
 
             val hp = DoubleArray(9)
             homographyProxy.get(0, 0, hp)
-            homographyProxy.release()
 
             val h22 = if (abs(hp[8]) > 1e-9) hp[8] else 1.0
             val hFull = doubleArrayOf(
@@ -334,6 +379,11 @@ internal object OpenCvAlignmentPipeline {
         } catch (_: Exception) {
             null
         } finally {
+            knnMatches.forEach { it.release() }
+            srcPts?.release()
+            dstPts?.release()
+            homographyProxy?.release()
+            emptyMask.release()
             srcKeypoints.release()
             srcDescriptors.release()
         }
@@ -432,49 +482,65 @@ internal object OpenCvAlignmentPipeline {
             FrameTransform.Identity -> srcBgr
             is FrameTransform.Affine -> {
                 val mat = Mat(2, 3, CvType.CV_64F)
-                mat.put(0, 0, *transform.matrix2x3)
                 val warped = Mat()
-                Imgproc.warpAffine(
-                    srcBgr,
-                    warped,
-                    mat,
-                    Size(targetWidth.toDouble(), targetHeight.toDouble()),
-                    Imgproc.INTER_LINEAR,
-                    Core.BORDER_REPLICATE
-                )
-                mat.release()
-                warped
+                try {
+                    mat.put(0, 0, *transform.matrix2x3)
+                    Imgproc.warpAffine(
+                        srcBgr,
+                        warped,
+                        mat,
+                        Size(targetWidth.toDouble(), targetHeight.toDouble()),
+                        Imgproc.INTER_LINEAR,
+                        Core.BORDER_REPLICATE
+                    )
+                    warped
+                } catch (t: Throwable) {
+                    warped.release()
+                    throw t
+                } finally {
+                    mat.release()
+                }
             }
             is FrameTransform.Homography -> {
                 val mat = Mat(3, 3, CvType.CV_64F)
-                mat.put(0, 0, *transform.matrix3x3)
                 val warped = Mat()
-                Imgproc.warpPerspective(
-                    srcBgr,
-                    warped,
-                    mat,
-                    Size(targetWidth.toDouble(), targetHeight.toDouble()),
-                    Imgproc.INTER_LINEAR,
-                    Core.BORDER_REPLICATE
-                )
-                mat.release()
-                warped
+                try {
+                    mat.put(0, 0, *transform.matrix3x3)
+                    Imgproc.warpPerspective(
+                        srcBgr,
+                        warped,
+                        mat,
+                        Size(targetWidth.toDouble(), targetHeight.toDouble()),
+                        Imgproc.INTER_LINEAR,
+                        Core.BORDER_REPLICATE
+                    )
+                    warped
+                } catch (t: Throwable) {
+                    warped.release()
+                    throw t
+                } finally {
+                    mat.release()
+                }
             }
         }
     }
 
-    fun saveMatAsJpeg(bgrMat: Mat, file: File, quality: Int = 95) {
+    fun saveMatAsJpeg(bgrMat: Mat, file: File, quality: Int = 97) {
         val params = MatOfInt(Imgcodecs.IMWRITE_JPEG_QUALITY, quality)
         try {
             val ok = Imgcodecs.imwrite(file.absolutePath, bgrMat, params)
             if (!ok) {
                 val rgba = Mat()
-                Imgproc.cvtColor(bgrMat, rgba, Imgproc.COLOR_BGR2RGBA)
-                val bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
-                Utils.matToBitmap(rgba, bmp)
-                rgba.release()
-                file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, quality, it) }
-                bmp.recycle()
+                var bmp: Bitmap? = null
+                try {
+                    Imgproc.cvtColor(bgrMat, rgba, Imgproc.COLOR_BGR2RGBA)
+                    bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
+                    Utils.matToBitmap(rgba, bmp)
+                    file.outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, quality, it) }
+                } finally {
+                    rgba.release()
+                    if (bmp != null && !bmp.isRecycled) bmp.recycle()
+                }
             }
         } finally {
             params.release()
@@ -485,87 +551,128 @@ internal object OpenCvAlignmentPipeline {
         val w = bgrMat.cols()
         val h = bgrMat.rows()
         val maxDim = max(w, h)
-        val resizedBgr = if (maxDim > maxEdgePx) {
-            val scale = maxEdgePx.toDouble() / maxDim.toDouble()
-            val dst = Mat()
-            Imgproc.resize(
-                bgrMat,
-                dst,
-                Size((w * scale).coerceAtLeast(1.0), (h * scale).coerceAtLeast(1.0)),
-                0.0,
-                0.0,
-                Imgproc.INTER_AREA
-            )
-            dst
-        } else {
-            bgrMat
-        }
-
+        var resizedBgr: Mat? = null
         val rgba = Mat()
+        var bmp: Bitmap? = null
         return try {
-            Imgproc.cvtColor(resizedBgr, rgba, Imgproc.COLOR_BGR2RGBA)
-            val bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
+            val srcForRgba = if (maxDim > maxEdgePx) {
+                val scale = maxEdgePx.toDouble() / maxDim.toDouble()
+                val dst = Mat()
+                resizedBgr = dst
+                Imgproc.resize(
+                    bgrMat,
+                    dst,
+                    Size((w * scale).coerceAtLeast(1.0), (h * scale).coerceAtLeast(1.0)),
+                    0.0,
+                    0.0,
+                    Imgproc.INTER_AREA
+                )
+                dst
+            } else {
+                bgrMat
+            }
+            Imgproc.cvtColor(srcForRgba, rgba, Imgproc.COLOR_BGR2RGBA)
+            bmp = Bitmap.createBitmap(rgba.cols(), rgba.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(rgba, bmp)
             bmp
+        } catch (t: Throwable) {
+            if (bmp != null && !bmp.isRecycled) bmp.recycle()
+            throw t
         } finally {
             rgba.release()
-            if (resizedBgr !== bgrMat) resizedBgr.release()
+            resizedBgr?.release()
         }
     }
 
     fun buildLaplacianPyramidFromBgr(bgrMat: Mat, levels: Int): List<Mat> {
         val floatBgr = Mat()
-        bgrMat.convertTo(floatBgr, CvType.CV_32FC3, 1.0 / 255.0)
-        val imgGauss = buildGaussianPyramid(floatBgr, levels)
-        floatBgr.release()
-        val imgLap = buildLaplacianPyramid(imgGauss)
-        imgGauss.forEach { it.release() }
-        return imgLap
+        var imgGauss: List<Mat>? = null
+        return try {
+            bgrMat.convertTo(floatBgr, CvType.CV_32FC3, 1.0 / 255.0)
+            imgGauss = buildGaussianPyramid(floatBgr, levels)
+            floatBgr.release()
+            buildLaplacianPyramid(imgGauss)
+        } finally {
+            floatBgr.release()
+            imgGauss?.forEach { it.release() }
+        }
     }
 
     fun buildGaussianPyramid(base: Mat, levels: Int): List<Mat> {
         val pyramid = ArrayList<Mat>(levels)
-        var current = base.clone()
-        pyramid.add(current)
-        for (i in 1 until levels) {
-            val next = Mat()
-            Imgproc.pyrDown(current, next)
-            pyramid.add(next)
-            current = next
+        return try {
+            var current = base.clone()
+            pyramid.add(current)
+            for (i in 1 until levels) {
+                val next = Mat()
+                try {
+                    Imgproc.pyrDown(current, next)
+                    pyramid.add(next)
+                    current = next
+                } catch (t: Throwable) {
+                    next.release()
+                    throw t
+                }
+            }
+            pyramid
+        } catch (t: Throwable) {
+            pyramid.forEach { it.release() }
+            throw t
         }
-        return pyramid
     }
 
     fun buildLaplacianPyramid(gaussianPyramid: List<Mat>): List<Mat> {
         val levels = gaussianPyramid.size
         val laplacian = ArrayList<Mat>(levels)
-        for (i in 0 until levels - 1) {
-            val current = gaussianPyramid[i]
-            val next = gaussianPyramid[i + 1]
-            val upsampled = Mat()
-            Imgproc.pyrUp(next, upsampled, current.size())
-            val diff = Mat()
-            Core.subtract(current, upsampled, diff)
-            upsampled.release()
-            laplacian.add(diff)
+        return try {
+            for (i in 0 until levels - 1) {
+                val current = gaussianPyramid[i]
+                val next = gaussianPyramid[i + 1]
+                val upsampled = Mat()
+                val diff = Mat()
+                try {
+                    Imgproc.pyrUp(next, upsampled, current.size())
+                    Core.subtract(current, upsampled, diff)
+                    laplacian.add(diff)
+                } catch (t: Throwable) {
+                    diff.release()
+                    throw t
+                } finally {
+                    upsampled.release()
+                }
+            }
+            laplacian.add(gaussianPyramid[levels - 1].clone())
+            laplacian
+        } catch (t: Throwable) {
+            laplacian.forEach { it.release() }
+            throw t
         }
-        laplacian.add(gaussianPyramid[levels - 1].clone())
-        return laplacian
     }
 
     fun reconstructLaplacianPyramid(laplacianPyramid: List<Mat>): Mat {
         var current = laplacianPyramid.last().clone()
-        for (i in laplacianPyramid.size - 2 downTo 0) {
-            val target = laplacianPyramid[i]
-            val upsampled = Mat()
-            Imgproc.pyrUp(current, upsampled, target.size())
+        try {
+            for (i in laplacianPyramid.size - 2 downTo 0) {
+                val target = laplacianPyramid[i]
+                val upsampled = Mat()
+                val merged = Mat()
+                try {
+                    Imgproc.pyrUp(current, upsampled, target.size())
+                    current.release()
+                    Core.add(upsampled, target, merged)
+                    current = merged
+                } catch (t: Throwable) {
+                    merged.release()
+                    throw t
+                } finally {
+                    upsampled.release()
+                }
+            }
+            return current
+        } catch (t: Throwable) {
             current.release()
-            val merged = Mat()
-            Core.add(upsampled, target, merged)
-            upsampled.release()
-            current = merged
+            throw t
         }
-        return current
     }
 
     fun computePyramidLevels(width: Int, height: Int): Int {
@@ -581,24 +688,35 @@ internal object OpenCvAlignmentPipeline {
     fun bitmapToBgrMat(bitmap: Bitmap): Mat {
         val rgba = Mat()
         val bgr = Mat()
-        Utils.bitmapToMat(bitmap, rgba)
-        Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
-        rgba.release()
-        return bgr
+        return try {
+            Utils.bitmapToMat(bitmap, rgba)
+            Imgproc.cvtColor(rgba, bgr, Imgproc.COLOR_RGBA2BGR)
+            bgr
+        } catch (t: Throwable) {
+            bgr.release()
+            throw t
+        } finally {
+            rgba.release()
+        }
     }
 
-    fun floatBgrMatToBitmap(floatBgr: Mat): Bitmap {
+    fun floatBgrMatToBitmap(floatBgr: Mat, scaleTo255: Double = 255.0): Bitmap {
         val clamped = Mat()
         val u8Bgr = Mat()
         val u8Rgba = Mat()
-        try {
-            Core.min(floatBgr, Scalar(1.0, 1.0, 1.0), clamped)
+        var bitmap: Bitmap? = null
+        return try {
+            val maxBound = if (scaleTo255 == 1.0) 255.0 else 1.0
+            Core.min(floatBgr, Scalar(maxBound, maxBound, maxBound), clamped)
             Core.max(clamped, Scalar(0.0, 0.0, 0.0), clamped)
-            clamped.convertTo(u8Bgr, CvType.CV_8UC3, 255.0)
+            clamped.convertTo(u8Bgr, CvType.CV_8UC3, scaleTo255)
             Imgproc.cvtColor(u8Bgr, u8Rgba, Imgproc.COLOR_BGR2RGBA)
-            val bitmap = Bitmap.createBitmap(u8Rgba.cols(), u8Rgba.rows(), Bitmap.Config.ARGB_8888)
+            bitmap = Bitmap.createBitmap(u8Rgba.cols(), u8Rgba.rows(), Bitmap.Config.ARGB_8888)
             Utils.matToBitmap(u8Rgba, bitmap)
-            return bitmap
+            bitmap
+        } catch (t: Throwable) {
+            if (bitmap != null && !bitmap.isRecycled) bitmap.recycle()
+            throw t
         } finally {
             clamped.release()
             u8Bgr.release()

@@ -28,12 +28,14 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -77,6 +79,13 @@ fun ProcessingOverlay(
             usePlatformDefaultWidth = false
         )
     ) {
+        val dialogView = LocalView.current
+        DisposableEffect(dialogView) {
+            dialogView.keepScreenOn = true
+            onDispose {
+                dialogView.keepScreenOn = false
+            }
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()

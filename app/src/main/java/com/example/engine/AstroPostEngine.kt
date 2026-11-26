@@ -164,14 +164,16 @@ object AstroPostEngine {
             Core.multiply(diff, Scalar(strength.toDouble(), strength.toDouble(), strength.toDouble()), diff)
             Core.subtract(floatBgr, diff, out)
             Core.max(out, Scalar(0.0, 0.0, 0.0), out)
-            out.clone()
+            out
+        } catch (t: Throwable) {
+            out.release()
+            throw t
         } finally {
             small.release()
             opened.release()
             smoothSmall.release()
             bgFull.release()
             diff.release()
-            out.release()
             morphKernel.release()
         }
     }
@@ -192,51 +194,62 @@ object AstroPostEngine {
         val chunkRows = min(64, rows)
         val buf = FloatArray(chunkRows * cols * 3)
 
-        var r = 0
-        while (r < rows) {
-            val count = min(chunkRows, rows - r)
-            val srcSub = floatBgr.rowRange(r, r + count)
-            srcSub.get(0, 0, buf)
-            srcSub.release()
-
-            val total = count * cols
-            var idx = 0
-            for (i in 0 until total) {
-                val b = buf[idx].coerceAtLeast(0f)
-                val g = buf[idx + 1].coerceAtLeast(0f)
-                val red = buf[idx + 2].coerceAtLeast(0f)
-
-                val lum = (0.0722f * b + 0.7152f * g + 0.2126f * red)
-                if (lum > 1e-5f) {
-                    val stretchedLum = (asinh(beta * lum.toDouble()) / normDenom).toFloat()
-                    val gain = stretchedLum / lum
-                    val outB = b * gain
-                    val outG = g * gain
-                    val outR = red * gain
-                    val maxCh = max(outB, max(outG, outR))
-                    if (maxCh > 1f) {
-                        // Soft chromatic highlight roll-off to preserve star core color
-                        val inv = 1f / maxCh
-                        val blend = (stretch * 0.25f).coerceIn(0f, 0.25f)
-                        buf[idx] = (outB * inv * (1f - blend) + outB.coerceAtMost(1f) * blend)
-                        buf[idx + 1] = (outG * inv * (1f - blend) + outG.coerceAtMost(1f) * blend)
-                        buf[idx + 2] = (outR * inv * (1f - blend) + outR.coerceAtMost(1f) * blend)
-                    } else {
-                        buf[idx] = outB
-                        buf[idx + 1] = outG
-                        buf[idx + 2] = outR
-                    }
+        try {
+            var r = 0
+            while (r < rows) {
+                val count = min(chunkRows, rows - r)
+                val srcSub = floatBgr.rowRange(r, r + count)
+                try {
+                    srcSub.get(0, 0, buf)
+                } finally {
+                    srcSub.release()
                 }
-                idx += 3
+
+                val total = count * cols
+                var idx = 0
+                for (i in 0 until total) {
+                    val b = buf[idx].coerceAtLeast(0f)
+                    val g = buf[idx + 1].coerceAtLeast(0f)
+                    val red = buf[idx + 2].coerceAtLeast(0f)
+
+                    val lum = (0.0722f * b + 0.7152f * g + 0.2126f * red)
+                    if (lum > 1e-5f) {
+                        val stretchedLum = (asinh(beta * lum.toDouble()) / normDenom).toFloat()
+                        val gain = stretchedLum / lum
+                        val outB = b * gain
+                        val outG = g * gain
+                        val outR = red * gain
+                        val maxCh = max(outB, max(outG, outR))
+                        if (maxCh > 1f) {
+                            // Soft chromatic highlight roll-off to preserve star core color
+                            val inv = 1f / maxCh
+                            val blend = (stretch * 0.25f).coerceIn(0f, 0.25f)
+                            buf[idx] = (outB * inv * (1f - blend) + outB.coerceAtMost(1f) * blend)
+                            buf[idx + 1] = (outG * inv * (1f - blend) + outG.coerceAtMost(1f) * blend)
+                            buf[idx + 2] = (outR * inv * (1f - blend) + outR.coerceAtMost(1f) * blend)
+                        } else {
+                            buf[idx] = outB
+                            buf[idx + 1] = outG
+                            buf[idx + 2] = outR
+                        }
+                    }
+                    idx += 3
+                }
+
+                val dstSub = out.rowRange(r, r + count)
+                try {
+                    dstSub.put(0, 0, buf)
+                } finally {
+                    dstSub.release()
+                }
+                r += count
             }
 
-            val dstSub = out.rowRange(r, r + count)
-            dstSub.put(0, 0, buf)
-            dstSub.release()
-            r += count
+            return out
+        } catch (t: Throwable) {
+            out.release()
+            throw t
         }
-
-        return out
     }
 
     /**

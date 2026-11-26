@@ -1,6 +1,8 @@
 package com.example
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.net.Uri
@@ -16,8 +18,10 @@ import com.example.domain.model.RetouchStroke
 import com.example.domain.model.StackFrame
 import com.example.domain.model.StackMode
 import com.example.engine.AstroStackProcessor
+import com.example.engine.FrameBitmapLoader
 import com.example.engine.RetouchAndPeakingUtils
 import com.example.ui.StackLabUiState
+import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -151,5 +155,27 @@ class ExampleRobolectricTest {
         val maskBmp = RetouchAndPeakingUtils.renderRetouchMaskOverlay(100, 100, listOf(stroke))
         assertTrue(Color.alpha(maskBmp.getPixel(50, 50)) > 0)
         assertEquals(0, Color.alpha(maskBmp.getPixel(5, 5)))
+    }
+
+    @Test
+    fun `retouch cache clears retouch_cache directory and wake lock permission is declared`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val loader = FrameBitmapLoader(context)
+
+        val runDir = loader.getRetouchRunDir("run_test")
+        val dummyFrame = File(runDir, "aligned_0.jpg").apply { writeText("test") }
+        val legacyDir = File(context.cacheDir, "retouch_frames").apply { mkdirs() }
+        File(legacyDir, "old.jpg").writeText("old")
+
+        assertTrue(dummyFrame.exists())
+        loader.clearRetouchCache()
+        assertFalse(File(context.cacheDir, FrameBitmapLoader.RETOUCH_CACHE_DIR).exists())
+        assertFalse(legacyDir.exists())
+
+        val pkgInfo = context.packageManager.getPackageInfo(
+            context.packageName,
+            PackageManager.GET_PERMISSIONS
+        )
+        assertTrue(pkgInfo.requestedPermissions?.contains(Manifest.permission.WAKE_LOCK) == true)
     }
 }

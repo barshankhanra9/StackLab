@@ -1,5 +1,6 @@
 package com.example.ui.screens
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
@@ -108,6 +109,7 @@ import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.domain.model.AstroStretchAdjustments
 import com.example.domain.model.HdrToneAdjustments
+import com.example.domain.model.OutputFormat
 import com.example.domain.model.RetouchPoint
 import com.example.domain.model.StackMode
 import com.example.ui.StackLabUiState
@@ -132,6 +134,7 @@ fun ResultScreen(
     uiState: StackLabUiState,
     onNavigateBack: () -> Unit,
     onSaveFullRes: () -> Unit,
+    onSelectOutputFormat: (OutputFormat) -> Unit,
     onNewStack: () -> Unit,
     onToggleFocusPeaking: (Int) -> Unit,
     onCompareFrameChanged: (Int) -> Unit,
@@ -151,6 +154,14 @@ fun ResultScreen(
 ) {
     val result = uiState.result
     val snackbarHostState = remember { SnackbarHostState() }
+
+    BackHandler(enabled = true) {
+        if (uiState.isRetouchMode) {
+            onSetRetouchMode(false)
+        } else {
+            onNavigateBack()
+        }
+    }
 
     var splitFraction by rememberSaveable { mutableFloatStateOf(0.5f) }
     var inspectSingleFrame by rememberSaveable { mutableStateOf(false) }
@@ -332,6 +343,60 @@ fun ResultScreen(
                                             modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp)
                                         )
                                     }
+                                }
+                            }
+
+                            // Unified Export Format Selector (JPEG 95% + EXIF vs Lossless PNG)
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "EXPORT:",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MutedSlate
+                                )
+                                val jpegSelected = uiState.outputSettings.outputFormat == OutputFormat.JPEG
+                                Surface(
+                                    onClick = { onSelectOutputFormat(OutputFormat.JPEG) },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (jpegSelected) AmberDim else ObsidianBackground,
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (jpegSelected) AmberAccent else HairlineBorder
+                                    ),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("result_format_jpeg")
+                                ) {
+                                    Text(
+                                        text = "JPEG ${uiState.outputSettings.jpegQuality}% • EXIF",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (jpegSelected) AmberAccent else CrispWhite,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                                    )
+                                }
+
+                                val pngSelected = uiState.outputSettings.outputFormat == OutputFormat.PNG
+                                Surface(
+                                    onClick = { onSelectOutputFormat(OutputFormat.PNG) },
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = if (pngSelected) CyanDim else ObsidianBackground,
+                                    border = BorderStroke(
+                                        1.dp,
+                                        if (pngSelected) CyanAccent else HairlineBorder
+                                    ),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .testTag("result_format_png")
+                                ) {
+                                    Text(
+                                        text = "PNG Lossless",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (pngSelected) CyanAccent else CrispWhite,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
+                                    )
                                 }
                             }
 

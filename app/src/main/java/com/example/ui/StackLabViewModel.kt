@@ -1,8 +1,10 @@
 package com.example.ui
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.net.Uri
+import android.os.PowerManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.MediaStoreExporter
@@ -151,6 +153,8 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     private var analysisJob: Job? = null
     private var peakingJob: Job? = null
     private var toneJob: Job? = null
+    private var retouchSourceJob: Job? = null
+    private val retouchSourceLock = Any()
 
     // Retouch & post-fusion tone session buffers (kept strictly O(1) — only 1 active source frame in RAM)
     private var baseOutputBitmap: Bitmap? = null
@@ -175,6 +179,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         if (switchingFromOtherMode) {
             clearRetouchAndPeakingState()
             recycleResultBitmaps(_uiState.value.result)
+            bitmapLoader.clearRetouchCache()
         }
         _uiState.update { state ->
             state.copy(
@@ -195,6 +200,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         if (switchingFromOtherMode) {
             clearRetouchAndPeakingState()
             recycleResultBitmaps(_uiState.value.result)
+            bitmapLoader.clearRetouchCache()
         }
         _uiState.update { state ->
             state.copy(
@@ -221,6 +227,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             analysisJob?.cancel()
             clearRetouchAndPeakingState()
             recycleResultBitmaps(_uiState.value.result)
+            bitmapLoader.clearRetouchCache()
         }
         viewModelScope.launch {
             val newFrames = withContext(Dispatchers.IO) {
@@ -689,7 +696,22 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     )
                 )
             }
+
+            val powerManager = getApplication<Application>().getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val wakeLock = try {
+                powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "StackLab:StackingWakeLock")?.apply {
+                    setReferenceCounted(false)
+                    acquire(15 * 60 * 1000L)
+                }
+            } catch (_: Throwable) {
+                null
+            }
+
             try {
+                withContext(Dispatchers.IO) {
+                    bitmapLoader.clearRetouchCache()
+                }
+
                 val onProgress: (StackProgress) -> Unit = { progress ->
                     _uiState.update { state ->
                         if (state.processingState is ProcessingUiState.Running) {
@@ -797,6 +819,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 }
                 _navEvents.tryEmit(StackLabNavEvent.OpenResult)
             } catch (_: CancellationException) {
+                bitmapLoader.clearRetouchCache()
                 _uiState.update {
                     it.copy(
                         processingState = ProcessingUiState.Idle,
@@ -804,12 +827,21 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     )
                 }
             } catch (t: Throwable) {
+                bitmapLoader.clearRetouchCache()
                 _uiState.update {
                     it.copy(
                         processingState = ProcessingUiState.Idle,
                         snackbarMessage = t.message ?: "Stacking failed. Try fewer frames or lower output resolution."
                     )
                 }
+            } finally {
+                try {
+                    if (wakeLock?.isHeld == true) {
+                        wakeLock.release()
+                    }
+                } catch (_: Throwable) {
+                }
+                System.gc()
             }
         }
     }
@@ -823,13 +855,37 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     // --- Manual Retouch Mode ---
 
     fun setRetouchMode(enabled: Boolean) {
-        _uiState.update { it.copy(isRetouchMode = enabled) }
+        if (!enabled) {
+            retouchSourceJob?.cancel()
+            releaseActiveRetouchSourceBitmap()
+            _uiState.update { it.copy(isRetouchMode = false) }
+            return
+        }
+        val result = _uiState.value.result
+        val targetIndex = if (result != null) {
+            _uiState.value.retouchSourceIndex.coerceIn(0, (result.sourcePreviewBitmaps.size - 1).coerceAtLeast(0))
+        } else 0
+        _uiState.update { it.copy(isRetouchMode = true, retouchSourceIndex = targetIndex) }
+        if (result != null) {
+            preloadSingleRetouchSourceFrame(result, targetIndex)
+        }
     }
 
     fun selectRetouchSourceFrame(index: Int) {
-        val result = _uiState.value.result ?: return
+        val state = _uiState.value
+        val result = state.result ?: return
         val clamped = index.coerceIn(0, result.sourcePreviewBitmaps.lastIndex)
         _uiState.update { it.copy(retouchSourceIndex = clamped) }
+        if (state.isRetouchMode) {
+            preloadSingleRetouchSourceFrame(result, clamped)
+        }
+    }
+
+    private fun preloadSingleRetouchSourceFrame(result: StackResult, index: Int) {
+        retouchSourceJob?.cancel()
+        retouchSourceJob = viewModelScope.launch(Dispatchers.IO) {
+            loadOrGetActiveRetouchSource(result, index)
+        }
     }
 
     fun setRetouchBrushSize(fraction: Float) {
@@ -861,9 +917,11 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             _uiState.update { it.copy(isApplyingRetouch = true) }
             try {
                 val (displayBitmap, newMask, newPeaking) = withContext(Dispatchers.Default) {
-                    val working = ensureMutableWorkingBitmap(result.outputBitmap)
-                    val sourceBmp = loadOrGetActiveRetouchSource(result, stroke.sourceFrameIndex)
-                    RetouchAndPeakingUtils.applyRetouchStroke(working, sourceBmp, stroke)
+                    val working = ensureMutableWorkingBitmap(baseOutputBitmap ?: result.outputBitmap)
+                    synchronized(retouchSourceLock) {
+                        val sourceBmp = loadOrGetActiveRetouchSource(result, stroke.sourceFrameIndex)
+                        RetouchAndPeakingUtils.applyRetouchStroke(working, sourceBmp, stroke)
+                    }
 
                     undoStrokes.add(stroke)
                     redoStrokes.clear()
@@ -884,7 +942,9 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
                 val oldMask = _uiState.value.retouchMaskBitmap
                 val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
+                var oldDisplay: Bitmap? = null
                 _uiState.update { current ->
+                    oldDisplay = current.result?.outputBitmap
                     current.copy(
                         result = current.result?.copy(outputBitmap = displayBitmap),
                         retouchBitmapVersion = current.retouchBitmapVersion + 1,
@@ -896,6 +956,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                         lastSavedPath = null
                     )
                 }
+                safeRecycleBitmapIfUnused(oldDisplay, keep1 = displayBitmap)
                 if (oldMask != null && oldMask !== newMask && !oldMask.isRecycled) oldMask.recycle()
                 if (newPeaking != null && oldPeaking != null && oldPeaking !== newPeaking && !oldPeaking.isRecycled) {
                     oldPeaking.recycle()
@@ -918,15 +979,18 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
         viewModelScope.launch {
             _uiState.update { it.copy(isApplyingRetouch = true) }
+            val oldWorking = workingOutputBitmap
             val (rebuiltDisplay, newMask, newPeaking) = withContext(Dispatchers.Default) {
                 val popped = undoStrokes.removeAt(undoStrokes.lastIndex)
                 redoStrokes.add(popped)
 
                 val base = baseOutputBitmap ?: result.outputBitmap
                 val freshWorking = base.copy(Bitmap.Config.ARGB_8888, true)
-                for (s in undoStrokes) {
-                    val src = loadOrGetActiveRetouchSource(result, s.sourceFrameIndex)
-                    RetouchAndPeakingUtils.applyRetouchStroke(freshWorking, src, s)
+                synchronized(retouchSourceLock) {
+                    for (s in undoStrokes) {
+                        val src = loadOrGetActiveRetouchSource(result, s.sourceFrameIndex)
+                        RetouchAndPeakingUtils.applyRetouchStroke(freshWorking, src, s)
+                    }
                 }
                 workingOutputBitmap = freshWorking
 
@@ -949,7 +1013,9 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
             val oldMask = _uiState.value.retouchMaskBitmap
             val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
+            var oldDisplay: Bitmap? = null
             _uiState.update { current ->
+                oldDisplay = current.result?.outputBitmap
                 current.copy(
                     result = current.result?.copy(outputBitmap = rebuiltDisplay),
                     retouchBitmapVersion = current.retouchBitmapVersion + 1,
@@ -961,6 +1027,8 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     lastSavedPath = null
                 )
             }
+            safeRecycleBitmapIfUnused(oldDisplay, keep1 = rebuiltDisplay)
+            safeRecycleBitmapIfUnused(oldWorking, keep1 = rebuiltDisplay)
             if (oldMask != null && oldMask !== newMask && !oldMask.isRecycled) oldMask.recycle()
             if (newPeaking != null && oldPeaking != null && oldPeaking !== newPeaking && !oldPeaking.isRecycled) {
                 oldPeaking.recycle()
@@ -977,9 +1045,11 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             _uiState.update { it.copy(isApplyingRetouch = true) }
             val (displayBitmap, newMask, newPeaking) = withContext(Dispatchers.Default) {
                 val stroke = redoStrokes.removeAt(redoStrokes.lastIndex)
-                val working = ensureMutableWorkingBitmap(result.outputBitmap)
-                val src = loadOrGetActiveRetouchSource(result, stroke.sourceFrameIndex)
-                RetouchAndPeakingUtils.applyRetouchStroke(working, src, stroke)
+                val working = ensureMutableWorkingBitmap(baseOutputBitmap ?: result.outputBitmap)
+                synchronized(retouchSourceLock) {
+                    val src = loadOrGetActiveRetouchSource(result, stroke.sourceFrameIndex)
+                    RetouchAndPeakingUtils.applyRetouchStroke(working, src, stroke)
+                }
                 undoStrokes.add(stroke)
 
                 val display = refreshPreviewAndApplyTone(working, result.stackMode, _uiState.value.hdrToneAdjustments)
@@ -998,7 +1068,9 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
             val oldMask = _uiState.value.retouchMaskBitmap
             val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
+            var oldDisplay: Bitmap? = null
             _uiState.update { current ->
+                oldDisplay = current.result?.outputBitmap
                 current.copy(
                     result = current.result?.copy(outputBitmap = displayBitmap),
                     retouchBitmapVersion = current.retouchBitmapVersion + 1,
@@ -1010,6 +1082,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     lastSavedPath = null
                 )
             }
+            safeRecycleBitmapIfUnused(oldDisplay, keep1 = displayBitmap)
             if (oldMask != null && oldMask !== newMask && !oldMask.isRecycled) oldMask.recycle()
             if (newPeaking != null && oldPeaking != null && oldPeaking !== newPeaking && !oldPeaking.isRecycled) {
                 oldPeaking.recycle()
@@ -1028,20 +1101,37 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     }
 
     private fun loadOrGetActiveRetouchSource(result: StackResult, index: Int): Bitmap {
-        val cached = activeRetouchSourceBitmap
-        if (activeRetouchSourceIndex == index && cached != null && !cached.isRecycled) {
-            return cached
-        }
-        val cachePath = result.alignedSourceCachePaths.getOrNull(index)
-        val loaded = if (cachePath != null) bitmapLoader.loadCachedBitmap(cachePath) else null
-        val resolved = loaded ?: result.sourcePreviewBitmaps[index]
+        synchronized(retouchSourceLock) {
+            val cached = activeRetouchSourceBitmap
+            if (activeRetouchSourceIndex == index && cached != null && !cached.isRecycled) {
+                return cached
+            }
+            val cachePath = result.alignedSourceCachePaths.getOrNull(index)
+            val loaded = if (cachePath != null) bitmapLoader.loadCachedBitmap(cachePath) else null
+            val resolved = loaded ?: result.sourcePreviewBitmaps[index]
 
-        if (cached != null && cached !== resolved && cached !in result.sourcePreviewBitmaps && !cached.isRecycled) {
-            cached.recycle()
+            if (cached != null && cached !== resolved && cached !in result.sourcePreviewBitmaps && !cached.isRecycled) {
+                cached.recycle()
+            }
+            activeRetouchSourceIndex = index
+            activeRetouchSourceBitmap = resolved
+            return resolved
         }
-        activeRetouchSourceIndex = index
-        activeRetouchSourceBitmap = resolved
-        return resolved
+    }
+
+    private fun releaseActiveRetouchSourceBitmap() {
+        synchronized(retouchSourceLock) {
+            val result = _uiState.value.result
+            val cached = activeRetouchSourceBitmap
+            if (cached != null &&
+                (result == null || cached !in result.sourcePreviewBitmaps) &&
+                !cached.isRecycled
+            ) {
+                cached.recycle()
+            }
+            activeRetouchSourceBitmap = null
+            activeRetouchSourceIndex = -1
+        }
     }
 
     // --- Focus Peaking Overlay ---
@@ -1206,7 +1296,9 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 }
 
                 val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
+                var oldDisplay: Bitmap? = null
                 _uiState.update { current ->
+                    oldDisplay = current.result?.outputBitmap
                     current.copy(
                         result = current.result?.copy(outputBitmap = updatedDisplay),
                         retouchBitmapVersion = current.retouchBitmapVersion + 1,
@@ -1214,6 +1306,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                         isApplyingTone = false
                     )
                 }
+                safeRecycleBitmapIfUnused(oldDisplay, keep1 = updatedDisplay)
                 if (updatedPeaking != null && oldPeaking != null && oldPeaking !== updatedPeaking && !oldPeaking.isRecycled) {
                     oldPeaking.recycle()
                 }
@@ -1275,7 +1368,9 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 }
 
                 val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
+                var oldDisplay: Bitmap? = null
                 _uiState.update { current ->
+                    oldDisplay = current.result?.outputBitmap
                     current.copy(
                         result = current.result?.copy(outputBitmap = updatedDisplay),
                         retouchBitmapVersion = current.retouchBitmapVersion + 1,
@@ -1283,6 +1378,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                         isApplyingTone = false
                     )
                 }
+                safeRecycleBitmapIfUnused(oldDisplay, keep1 = updatedDisplay)
                 if (updatedPeaking != null && oldPeaking != null && oldPeaking !== updatedPeaking && !oldPeaking.isRecycled) {
                     oldPeaking.recycle()
                 }
@@ -1344,11 +1440,15 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                         }
                     }
                 }
+                val formatSummary = when (state.outputSettings.outputFormat) {
+                    OutputFormat.JPEG -> "JPEG (${state.outputSettings.jpegQuality}%) with EXIF"
+                    OutputFormat.PNG -> "lossless PNG"
+                }
                 _uiState.update {
                     it.copy(
                         isSaving = false,
                         lastSavedPath = outcome.displayPath,
-                        snackbarMessage = "Saved with EXIF to ${outcome.displayPath}"
+                        snackbarMessage = "Saved $formatSummary to ${outcome.displayPath}"
                     )
                 }
             } catch (t: Throwable) {
@@ -1362,9 +1462,26 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun onExitResultScreen() {
+        clearRetouchAndPeakingState()
+        recycleResultBitmaps(_uiState.value.result)
+        bitmapLoader.clearRetouchCache()
+        _uiState.update {
+            it.copy(
+                hdrToneAdjustments = HdrToneAdjustments(),
+                astroStretchAdjustments = AstroStretchAdjustments(),
+                result = null,
+                retouchBitmapVersion = 0,
+                lastSavedPath = null
+            )
+        }
+        System.gc()
+    }
+
     fun startNewStack() {
         clearRetouchAndPeakingState()
         recycleResultBitmaps(_uiState.value.result)
+        bitmapLoader.clearRetouchCache()
         _uiState.update {
             it.copy(
                 frames = emptyList(),
@@ -1379,6 +1496,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 processingState = ProcessingUiState.Idle
             )
         }
+        System.gc()
         _navEvents.tryEmit(StackLabNavEvent.ReturnHome)
     }
 
@@ -1394,23 +1512,29 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(snackbarMessage = null) }
     }
 
+    private fun safeRecycleBitmapIfUnused(candidate: Bitmap?, keep1: Bitmap? = null) {
+        if (candidate == null || candidate.isRecycled) return
+        if (candidate === keep1 ||
+            candidate === baseOutputBitmap ||
+            candidate === workingOutputBitmap ||
+            candidate === tonePreviewBaseBitmap
+        ) {
+            return
+        }
+        candidate.recycle()
+    }
+
     private fun clearRetouchAndPeakingState() {
         peakingJob?.cancel()
         toneJob?.cancel()
+        retouchSourceJob?.cancel()
         undoStrokes.clear()
         redoStrokes.clear()
 
         val state = _uiState.value
         val result = state.result
 
-        if (activeRetouchSourceBitmap != null &&
-            (result == null || activeRetouchSourceBitmap !in result.sourcePreviewBitmaps) &&
-            activeRetouchSourceBitmap?.isRecycled == false
-        ) {
-            activeRetouchSourceBitmap?.recycle()
-        }
-        activeRetouchSourceBitmap = null
-        activeRetouchSourceIndex = -1
+        releaseActiveRetouchSourceBitmap()
 
         if (tonePreviewBaseBitmap != null &&
             tonePreviewBaseBitmap !== result?.outputBitmap &&
@@ -1426,6 +1550,12 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             baseOutputBitmap?.recycle()
         }
         baseOutputBitmap = null
+        if (workingOutputBitmap != null &&
+            workingOutputBitmap !== result?.outputBitmap &&
+            workingOutputBitmap?.isRecycled == false
+        ) {
+            workingOutputBitmap?.recycle()
+        }
         workingOutputBitmap = null
 
         if (state.retouchMaskBitmap?.isRecycled == false) state.retouchMaskBitmap.recycle()
@@ -1463,7 +1593,9 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         analysisJob?.cancel()
         peakingJob?.cancel()
         toneJob?.cancel()
+        retouchSourceJob?.cancel()
         clearRetouchAndPeakingState()
         recycleResultBitmaps(_uiState.value.result)
+        bitmapLoader.clearRetouchCache()
     }
 }

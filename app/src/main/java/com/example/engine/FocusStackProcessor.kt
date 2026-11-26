@@ -99,6 +99,7 @@ class FocusStackProcessor(
         val runDir = bitmapLoader.getRetouchRunDir(UUID.randomUUID().toString())
         val preallocatedPreviews = arrayOfNulls<Bitmap>(frameCount)
         val preallocatedCachePaths = arrayOfNulls<String>(frameCount)
+        val previewCap = OpenCvAlignmentPipeline.previewMaxEdgeForFrameCount(frameCount)
 
         val pyramidLevels = OpenCvAlignmentPipeline.computePyramidLevels(outWidth, outHeight)
         val lapBlurKernel = (config.edgeSmoothingRadius.coerceIn(1, 15) * 2 + 1).toDouble()
@@ -109,6 +110,7 @@ class FocusStackProcessor(
         val numeratorPyramid = ArrayList<Mat>(pyramidLevels)
         val denominatorPyramid = ArrayList<Mat>(pyramidLevels)
         var runningMaxSharpness: Mat? = null
+        var completed = false
 
         val processingOrder = listOf(refIndex) + (0 until frameCount).filter { it != refIndex }
 
@@ -126,6 +128,7 @@ class FocusStackProcessor(
                     )
                 )
 
+                var frameBitmap: Bitmap? = null
                 var rawBgr: Mat? = null
                 var alignedBgr: Mat? = null
                 var croppedBgr: Mat? = null
@@ -133,13 +136,14 @@ class FocusStackProcessor(
                 var imgLap: List<Mat>? = null
 
                 try {
-                    val frameBitmap = bitmapLoader.loadNormalizedBitmap(
+                    frameBitmap = bitmapLoader.loadNormalizedBitmap(
                         uri = frames[frameIdx].uri,
                         targetWidth = targetWidth,
                         targetHeight = targetHeight
                     )
                     rawBgr = OpenCvAlignmentPipeline.bitmapToBgrMat(frameBitmap)
                     frameBitmap.recycle()
+                    frameBitmap = null
 
                     alignedBgr = OpenCvAlignmentPipeline.warpFullFrame(
                         rawBgr,
@@ -154,11 +158,13 @@ class FocusStackProcessor(
 
                     croppedBgr = if (wasAutoCropped) {
                         val sub = Mat(alignedBgr, cropRect)
-                        val cloned = sub.clone()
-                        sub.release()
-                        alignedBgr.release()
-                        alignedBgr = null
-                        cloned
+                        try {
+                            sub.clone()
+                        } finally {
+                            sub.release()
+                            alignedBgr.release()
+                            alignedBgr = null
+                        }
                     } else {
                         val ref = alignedBgr
                         alignedBgr = null
@@ -166,10 +172,14 @@ class FocusStackProcessor(
                     }
 
                     val cacheFile = File(runDir, "aligned_$frameIdx.jpg")
-                    OpenCvAlignmentPipeline.saveMatAsJpeg(croppedBgr, cacheFile)
+                    OpenCvAlignmentPipeline.saveMatAsJpeg(croppedBgr, cacheFile, quality = 97)
                     preallocatedCachePaths[frameIdx] = cacheFile.absolutePath
-                    preallocatedPreviews[frameIdx] = OpenCvAlignmentPipeline.createPreviewFromBgrMat(croppedBgr)
+                    preallocatedPreviews[frameIdx] = OpenCvAlignmentPipeline.createPreviewFromBgrMat(
+                        croppedBgr,
+                        maxEdgePx = previewCap
+                    )
 
+                    coroutineContext.ensureActive()
                     sharpnessMap = computeSharpnessEnergyMap(
                         bgrMat = croppedBgr,
                         preBlurKernel = lapBlurKernel,
@@ -193,7 +203,7 @@ class FocusStackProcessor(
                         }
 
                         BlendAlgorithm.PYRAMID_PMAX -> {
-                            runningMaxSharpness = accumulatePMaxFrame(
+                            val nextMax = accumulatePMaxFrame(
                                 isFirstFrame = (stepIdx == 0),
                                 imgLap = imgLap,
                                 sharpnessMap = sharpnessMap,
@@ -202,15 +212,18 @@ class FocusStackProcessor(
                                 maskBlurKernel = pmaxMaskBlurKernel,
                                 fusedPyramid = numeratorPyramid
                             )
+                            if (nextMax === sharpnessMap) {
+                                sharpnessMap = null // Ownership transferred to runningMaxSharpness
+                            }
+                            runningMaxSharpness = nextMax
                         }
                     }
                 } finally {
+                    if (frameBitmap != null && !frameBitmap.isRecycled) frameBitmap.recycle()
                     rawBgr?.release()
                     alignedBgr?.release()
                     croppedBgr?.release()
-                    if (config.blendAlgorithm == BlendAlgorithm.SMOOTH_DMAP || stepIdx > 0) {
-                        sharpnessMap?.release()
-                    }
+                    sharpnessMap?.release()
                     imgLap?.forEach { it.release() }
                 }
             }
@@ -228,10 +241,13 @@ class FocusStackProcessor(
             if (config.blendAlgorithm == BlendAlgorithm.SMOOTH_DMAP) {
                 for (level in 0 until pyramidLevels) {
                     val denom3ch = Mat()
-                    Imgproc.cvtColor(denominatorPyramid[level], denom3ch, Imgproc.COLOR_GRAY2BGR)
-                    Core.max(denom3ch, Scalar(1e-6, 1e-6, 1e-6), denom3ch)
-                    Core.divide(numeratorPyramid[level], denom3ch, numeratorPyramid[level])
-                    denom3ch.release()
+                    try {
+                        Imgproc.cvtColor(denominatorPyramid[level], denom3ch, Imgproc.COLOR_GRAY2BGR)
+                        Core.max(denom3ch, Scalar(1e-6, 1e-6, 1e-6), denom3ch)
+                        Core.divide(numeratorPyramid[level], denom3ch, numeratorPyramid[level])
+                    } finally {
+                        denom3ch.release()
+                    }
                 }
             }
 
@@ -244,8 +260,11 @@ class FocusStackProcessor(
             numeratorPyramid.forEach { it.release() }
             numeratorPyramid.clear()
 
-            val outputBitmap = OpenCvAlignmentPipeline.floatBgrMatToBitmap(reconstructedFloat)
-            reconstructedFloat.release()
+            val outputBitmap = try {
+                OpenCvAlignmentPipeline.floatBgrMatToBitmap(reconstructedFloat)
+            } finally {
+                reconstructedFloat.release()
+            }
 
             val elapsedMs = System.currentTimeMillis() - startTimeMs
 
@@ -258,6 +277,7 @@ class FocusStackProcessor(
                 )
             )
 
+            completed = true
             return StackResult(
                 outputBitmap = outputBitmap,
                 sourcePreviewBitmaps = preallocatedPreviews.map { it!! },
@@ -281,6 +301,13 @@ class FocusStackProcessor(
             runningMaxSharpness?.release()
             numeratorPyramid.forEach { it.release() }
             denominatorPyramid.forEach { it.release() }
+            if (!completed) {
+                preallocatedPreviews.forEach { bmp ->
+                    if (bmp != null && !bmp.isRecycled) bmp.recycle()
+                }
+                runDir.deleteRecursively()
+            }
+            System.gc()
         }
     }
 
@@ -294,19 +321,21 @@ class FocusStackProcessor(
         val lap = Mat()
         val energy = Mat()
         val windowedEnergy = Mat()
-        try {
+        return try {
             Imgproc.cvtColor(bgrMat, gray, Imgproc.COLOR_BGR2GRAY)
             Imgproc.GaussianBlur(gray, blurred, Size(preBlurKernel, preBlurKernel), 0.0)
             Imgproc.Laplacian(blurred, lap, CvType.CV_32F, 3)
             Core.multiply(lap, lap, energy)
             Imgproc.GaussianBlur(energy, windowedEnergy, Size(energyWindowKernel, energyWindowKernel), 0.0)
-            return windowedEnergy.clone()
+            windowedEnergy
+        } catch (t: Throwable) {
+            windowedEnergy.release()
+            throw t
         } finally {
             gray.release()
             blurred.release()
             lap.release()
             energy.release()
-            windowedEnergy.release()
         }
     }
 
@@ -330,18 +359,24 @@ class FocusStackProcessor(
             try {
                 for (level in 0 until pyramidLevels) {
                     val weight3ch = Mat()
-                    Imgproc.cvtColor(weightGauss[level], weight3ch, Imgproc.COLOR_GRAY2BGR)
                     val weighted = Mat()
-                    Core.multiply(imgLap[level], weight3ch, weighted)
-                    weight3ch.release()
+                    try {
+                        Imgproc.cvtColor(weightGauss[level], weight3ch, Imgproc.COLOR_GRAY2BGR)
+                        Core.multiply(imgLap[level], weight3ch, weighted)
 
-                    if (init) {
-                        numeratorPyramid.add(weighted)
-                        denominatorPyramid.add(weightGauss[level].clone())
-                    } else {
-                        Core.add(numeratorPyramid[level], weighted, numeratorPyramid[level])
+                        if (init) {
+                            numeratorPyramid.add(weighted)
+                            denominatorPyramid.add(weightGauss[level].clone())
+                        } else {
+                            Core.add(numeratorPyramid[level], weighted, numeratorPyramid[level])
+                            weighted.release()
+                            Core.add(denominatorPyramid[level], weightGauss[level], denominatorPyramid[level])
+                        }
+                    } catch (t: Throwable) {
                         weighted.release()
-                        Core.add(denominatorPyramid[level], weightGauss[level], denominatorPyramid[level])
+                        throw t
+                    } finally {
+                        weight3ch.release()
                     }
                 }
             } finally {
@@ -381,25 +416,26 @@ class FocusStackProcessor(
             try {
                 for (level in 0 until pyramidLevels) {
                     val alpha3ch = Mat()
-                    Imgproc.cvtColor(alphaGauss[level], alpha3ch, Imgproc.COLOR_GRAY2BGR)
-
                     val prevWeighted = Mat()
                     val currWeighted = Mat()
                     val invAlpha1ch = Mat()
-                    Core.multiply(alphaGauss[level], Scalar(-1.0), invAlpha1ch)
-                    Core.add(invAlpha1ch, Scalar(1.0), invAlpha1ch)
                     val inv3ch = Mat()
-                    Imgproc.cvtColor(invAlpha1ch, inv3ch, Imgproc.COLOR_GRAY2BGR)
-                    invAlpha1ch.release()
+                    try {
+                        Imgproc.cvtColor(alphaGauss[level], alpha3ch, Imgproc.COLOR_GRAY2BGR)
+                        Core.multiply(alphaGauss[level], Scalar(-1.0), invAlpha1ch)
+                        Core.add(invAlpha1ch, Scalar(1.0), invAlpha1ch)
+                        Imgproc.cvtColor(invAlpha1ch, inv3ch, Imgproc.COLOR_GRAY2BGR)
 
-                    Core.multiply(fusedPyramid[level], inv3ch, prevWeighted)
-                    Core.multiply(imgLap[level], alpha3ch, currWeighted)
-                    Core.add(prevWeighted, currWeighted, fusedPyramid[level])
-
-                    inv3ch.release()
-                    alpha3ch.release()
-                    prevWeighted.release()
-                    currWeighted.release()
+                        Core.multiply(fusedPyramid[level], inv3ch, prevWeighted)
+                        Core.multiply(imgLap[level], alpha3ch, currWeighted)
+                        Core.add(prevWeighted, currWeighted, fusedPyramid[level])
+                    } finally {
+                        invAlpha1ch.release()
+                        inv3ch.release()
+                        alpha3ch.release()
+                        prevWeighted.release()
+                        currWeighted.release()
+                    }
                 }
             } finally {
                 alphaGauss.forEach { it.release() }
