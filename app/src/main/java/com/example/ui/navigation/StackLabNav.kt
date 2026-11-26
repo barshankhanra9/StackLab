@@ -70,6 +70,7 @@ fun StackLabNav(
                     )
                 },
                 onHdrModeClicked = viewModel::openHdrWorkspace,
+                onAstroModeClicked = viewModel::openAstroWorkspace,
                 onComingSoonClicked = viewModel::onComingSoonModeClicked,
                 onSelectResolution = viewModel::updateMaxResolution,
                 onSelectFormat = viewModel::updateOutputFormat,
@@ -88,10 +89,10 @@ fun StackLabNav(
                 onSelectPreview = viewModel::selectPreviewFrame,
                 onToggleFrameEnabled = viewModel::toggleFrameEnabled,
                 onAutoSort = {
-                    if (uiState.activeMode == com.example.domain.model.StackMode.HdrExposureBlend) {
-                        viewModel.autoSortFramesByEv()
-                    } else {
-                        viewModel.autoSortFramesByFocusDistance()
+                    when (uiState.activeMode) {
+                        com.example.domain.model.StackMode.HdrExposureBlend -> viewModel.autoSortFramesByEv()
+                        com.example.domain.model.StackMode.AstroNoiseStack -> viewModel.sortAstroFramesLightsFirst()
+                        com.example.domain.model.StackMode.FocusStack -> viewModel.autoSortFramesByFocusDistance()
                     }
                 },
                 onRemoveFrame = viewModel::removeFrame,
@@ -104,6 +105,16 @@ fun StackLabNav(
                 onHdrSaturationWeightChange = viewModel::setHdrSaturationWeight,
                 onHdrExposureWeightChange = viewModel::setHdrExposureWeight,
                 onHdrDeghostingChange = viewModel::setHdrDeghostingEnabled,
+                onSelectHdrPreset = viewModel::selectHdrPreset,
+                onSelectHdrAnchorFrame = viewModel::selectHdrAnchorFrame,
+                onAstroFrameTypeChange = viewModel::setAstroFrameType,
+                onAstroAlignmentModeChange = viewModel::setAstroAlignmentMode,
+                onAstroStackAlgorithmChange = viewModel::setAstroStackAlgorithm,
+                onAstroSigmaThresholdChange = viewModel::setAstroSigmaThreshold,
+                onAstroFreezeGroundChange = viewModel::setAstroFreezeGroundEnabled,
+                onAddAstroFreezeStroke = viewModel::addAstroFreezeGroundStroke,
+                onUndoAstroFreezeStroke = viewModel::undoAstroFreezeGroundStroke,
+                onClearAstroFreezeStrokes = viewModel::clearAstroFreezeGroundStrokes,
                 onMaxResolutionChange = viewModel::updateMaxResolution,
                 onStartStacking = viewModel::startStacking,
                 onCancelStacking = viewModel::cancelStacking,
@@ -127,6 +138,10 @@ fun StackLabNav(
                 onCommitRetouchStroke = viewModel::commitRetouchStroke,
                 onUndoRetouch = viewModel::undoRetouchStroke,
                 onRedoRetouch = viewModel::redoRetouchStroke,
+                onToneAdjustmentsChange = viewModel::updateHdrToneAdjustments,
+                onResetToneAdjustments = viewModel::resetHdrToneAdjustments,
+                onAstroStretchAdjustmentsChange = viewModel::updateAstroStretchAdjustments,
+                onResetAstroStretchAdjustments = viewModel::resetAstroStretchAdjustments,
                 onSnackbarConsumed = viewModel::consumeSnackbar
             )
         }

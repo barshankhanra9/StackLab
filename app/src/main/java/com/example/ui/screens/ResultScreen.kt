@@ -1,9 +1,15 @@
 package com.example.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
@@ -23,6 +29,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -32,8 +39,10 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.Redo
@@ -43,18 +52,25 @@ import androidx.compose.material.icons.rounded.Brush
 import androidx.compose.material.icons.rounded.CenterFocusStrong
 import androidx.compose.material.icons.rounded.Compare
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.ExpandLess
+import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Photo
+import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.SwapHoriz
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.ZoomOutMap
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
@@ -90,7 +106,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
+import com.example.domain.model.AstroStretchAdjustments
+import com.example.domain.model.HdrToneAdjustments
 import com.example.domain.model.RetouchPoint
+import com.example.domain.model.StackMode
 import com.example.ui.StackLabUiState
 import com.example.ui.components.RetouchBottomPanel
 import com.example.ui.theme.AmberAccent
@@ -99,6 +118,7 @@ import com.example.ui.theme.CharcoalSurface
 import com.example.ui.theme.CrispWhite
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.CyanDim
+import com.example.ui.theme.ElevatedCharcoal
 import com.example.ui.theme.HairlineBorder
 import com.example.ui.theme.MutedSlate
 import com.example.ui.theme.ObsidianBackground
@@ -123,6 +143,10 @@ fun ResultScreen(
     onCommitRetouchStroke: (List<RetouchPoint>) -> Unit,
     onUndoRetouch: () -> Unit,
     onRedoRetouch: () -> Unit,
+    onToneAdjustmentsChange: (HdrToneAdjustments) -> Unit,
+    onResetToneAdjustments: () -> Unit,
+    onAstroStretchAdjustmentsChange: (AstroStretchAdjustments) -> Unit,
+    onResetAstroStretchAdjustments: () -> Unit,
     onSnackbarConsumed: () -> Unit
 ) {
     val result = uiState.result
@@ -134,6 +158,8 @@ fun ResultScreen(
         mutableIntStateOf(result?.defaultComparisonIndex ?: 0)
     }
     var inspectingResultInSingleMode by rememberSaveable { mutableStateOf(false) }
+    var toneBarExpanded by rememberSaveable { mutableStateOf(false) }
+    var astroBarExpanded by rememberSaveable { mutableStateOf(false) }
 
     var scale by remember { mutableFloatStateOf(1f) }
     var panOffset by remember { mutableStateOf(Offset.Zero) }
@@ -193,10 +219,37 @@ fun ResultScreen(
                                 .padding(horizontal = 16.dp, vertical = 12.dp),
                             verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
+                            if (result.stackMode == StackMode.HdrExposureBlend) {
+                                ToneAndDetailBar(
+                                    expanded = toneBarExpanded,
+                                    adjustments = uiState.hdrToneAdjustments,
+                                    isApplying = uiState.isApplyingTone,
+                                    onToggleExpanded = { toneBarExpanded = !toneBarExpanded },
+                                    onAdjustmentsChange = onToneAdjustmentsChange,
+                                    onReset = onResetToneAdjustments
+                                )
+                            } else if (result.stackMode == StackMode.AstroNoiseStack) {
+                                AstroStretchAndSkyBar(
+                                    expanded = astroBarExpanded,
+                                    adjustments = uiState.astroStretchAdjustments,
+                                    isApplying = uiState.isApplyingTone,
+                                    onToggleExpanded = { astroBarExpanded = !astroBarExpanded },
+                                    onAdjustmentsChange = onAstroStretchAdjustmentsChange,
+                                    onReset = onResetAstroStretchAdjustments
+                                )
+                            }
+
                             // Actual Output Dimensions & Telemetry Strip directly below image
-                            val actualW = result.outputBitmap.width
-                            val actualH = result.outputBitmap.height
+                            val actualW = result.outputWidth
+                            val actualH = result.outputHeight
                             val megapixels = (actualW.toLong() * actualH.toLong()) / 1_000_000.0
+                            val astroCalTag = if (result.stackMode == StackMode.AstroNoiseStack) {
+                                if (result.darkFramesUsed > 0) {
+                                    " • ${result.lightFramesUsed}L/${result.darkFramesUsed}D"
+                                } else {
+                                    " • ${result.lightFramesUsed}L"
+                                }
+                            } else ""
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -209,7 +262,7 @@ fun ResultScreen(
                                     modifier = Modifier.testTag("result_dimensions_text")
                                 )
                                 Text(
-                                    text = "${result.resolutionPreset.shortLabel} • ${result.alignmentNote}",
+                                    text = "${result.resolutionPreset.shortLabel} • ${result.alignmentNote}$astroCalTag",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MutedSlate
                                 )
@@ -982,10 +1035,10 @@ fun ResultScreen(
                             ) {
                                 Text(
                                     text = if (inspectingResultInSingleMode) {
-                                        if (result.stackMode == com.example.domain.model.StackMode.HdrExposureBlend) {
-                                            "VIEWING: HDR COMPOSITE"
-                                        } else {
-                                            "VIEWING: STACKED OUTPUT"
+                                        when (result.stackMode) {
+                                            StackMode.HdrExposureBlend -> "VIEWING: HDR COMPOSITE"
+                                            StackMode.AstroNoiseStack -> "VIEWING: ASTRO STACK"
+                                            StackMode.FocusStack -> "VIEWING: STACKED OUTPUT"
                                         }
                                     } else {
                                         "VIEWING: SOURCE #${safeCompareIdx + 1}$cmpSuffix"
@@ -1021,3 +1074,387 @@ fun ResultScreen(
         }
     }
 }
+
+@Composable
+private fun ToneAndDetailBar(
+    expanded: Boolean,
+    adjustments: HdrToneAdjustments,
+    isApplying: Boolean,
+    onToggleExpanded: () -> Unit,
+    onAdjustmentsChange: (HdrToneAdjustments) -> Unit,
+    onReset: () -> Unit
+) {
+    val activeCount = adjustments.activeCount()
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = ObsidianBackground.copy(alpha = 0.85f),
+        border = BorderStroke(
+            1.dp,
+            if (expanded || activeCount > 0) AmberAccent.copy(alpha = 0.45f) else HairlineBorder
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggleExpanded)
+                    .padding(horizontal = 12.dp, vertical = 9.dp)
+                    .testTag("toggle_tone_detail_bar"),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Tune,
+                        contentDescription = null,
+                        tint = AmberAccent,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = stringResource(R.string.tone_and_detail),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = CrispWhite
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (activeCount > 0) CyanDim else ElevatedCharcoal,
+                        border = BorderStroke(
+                            1.dp,
+                            if (activeCount > 0) CyanAccent.copy(alpha = 0.55f) else HairlineBorder
+                        )
+                    ) {
+                        Text(
+                            text = if (activeCount > 0) "$activeCount Active" else "Neutral",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (activeCount > 0) CyanAccent else MutedSlate,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                        )
+                    }
+                    if (isApplying) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(12.dp),
+                            color = AmberAccent,
+                            strokeWidth = 1.5.dp
+                        )
+                    }
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (activeCount > 0) {
+                        Surface(
+                            onClick = onReset,
+                            shape = RoundedCornerShape(6.dp),
+                            color = ElevatedCharcoal,
+                            border = BorderStroke(1.dp, HairlineBorder),
+                            modifier = Modifier.testTag("reset_tone_detail_button")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.RestartAlt,
+                                    contentDescription = null,
+                                    tint = CrispWhite,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Text(
+                                    text = stringResource(R.string.reset),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CrispWhite
+                                )
+                            }
+                        }
+                    }
+
+                    Icon(
+                        imageVector = if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.ExpandLess,
+                        contentDescription = if (expanded) "Collapse Tone & Detail" else "Expand Tone & Detail",
+                        tint = CrispWhite,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            AnimatedVisibility(
+                visible = expanded,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 228.dp)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp)
+                        .padding(bottom = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    HorizontalDivider(color = HairlineBorder)
+                    ToneSliderRow(
+                        label = "Highlight Recovery",
+                        hint = "Pulls back bright skies & windows",
+                        value = adjustments.highlightRecovery,
+                        accentColor = AmberAccent,
+                        testTag = "tone_highlight_slider",
+                        onValueChange = {
+                            onAdjustmentsChange(adjustments.copy(highlightRecovery = it))
+                        }
+                    )
+                    ToneSliderRow(
+                        label = "Shadow Lift",
+                        hint = "Brightens shadows without washing blacks",
+                        value = adjustments.shadowLift,
+                        accentColor = CyanAccent,
+                        testTag = "tone_shadow_slider",
+                        onValueChange = {
+                            onAdjustmentsChange(adjustments.copy(shadowLift = it))
+                        }
+                    )
+                    ToneSliderRow(
+                        label = "Micro-Contrast / Clarity",
+                        hint = "LAB Luminance CLAHE local texture punch",
+                        value = adjustments.clarity,
+                        accentColor = AmberAccent,
+                        testTag = "tone_clarity_slider",
+                        onValueChange = {
+                            onAdjustmentsChange(adjustments.copy(clarity = it))
+                        }
+                    )
+                    ToneSliderRow(
+                        label = "Vibrance",
+                        hint = "Boosts muted colors; protects skin & skies",
+                        value = adjustments.vibrance,
+                        accentColor = CyanAccent,
+                        testTag = "tone_vibrance_slider",
+                        onValueChange = {
+                            onAdjustmentsChange(adjustments.copy(vibrance = it))
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToneSliderRow(
+    label: String,
+    hint: String,
+    value: Float,
+    accentColor: Color,
+    testTag: String,
+    onValueChange: (Float) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = CrispWhite
+                )
+                Text(
+                    text = hint,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MutedSlate
+                )
+            }
+            Text(
+                text = "${(value * 100f).roundToInt()}%",
+                style = MaterialTheme.typography.labelMedium,
+                color = accentColor
+            )
+        }
+        Slider(
+            value = value,
+            onValueChange = {
+                val stepped = ((it * 100f).roundToInt() / 100f).coerceIn(0f, 1f)
+                onValueChange(stepped)
+            },
+            valueRange = 0f..1f,
+            colors = SliderDefaults.colors(
+                thumbColor = accentColor,
+                activeTrackColor = accentColor,
+                inactiveTrackColor = HairlineBorder
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(32.dp)
+                .testTag(testTag)
+        )
+    }
+}
+
+@Composable
+private fun AstroStretchAndSkyBar(
+    expanded: Boolean,
+    adjustments: AstroStretchAdjustments,
+    isApplying: Boolean,
+    onToggleExpanded: () -> Unit,
+    onAdjustmentsChange: (AstroStretchAdjustments) -> Unit,
+    onReset: () -> Unit
+) {
+    val activeCount = adjustments.activeCount()
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = ObsidianBackground.copy(alpha = 0.85f),
+        border = BorderStroke(
+            1.dp,
+            if (expanded || activeCount > 0) CyanAccent.copy(alpha = 0.50f) else HairlineBorder
+        ),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggleExpanded)
+                    .padding(horizontal = 12.dp, vertical = 9.dp)
+                    .testTag("toggle_astro_stretch_bar"),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Tune,
+                        contentDescription = null,
+                        tint = CyanAccent,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = stringResource(R.string.astro_stretch_sky),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = CrispWhite
+                    )
+                    Surface(
+                        shape = RoundedCornerShape(6.dp),
+                        color = if (activeCount > 0) CyanDim else ElevatedCharcoal,
+                        border = BorderStroke(
+                            1.dp,
+                            if (activeCount > 0) CyanAccent.copy(alpha = 0.55f) else HairlineBorder
+                        )
+                    ) {
+                        Text(
+                            text = if (activeCount > 0) "$activeCount Active" else "Linear",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (activeCount > 0) CyanAccent else MutedSlate,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                        )
+                    }
+                    if (isApplying) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(12.dp),
+                            color = CyanAccent,
+                            strokeWidth = 1.5.dp
+                        )
+                    }
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (activeCount > 0) {
+                        Surface(
+                            onClick = onReset,
+                            shape = RoundedCornerShape(6.dp),
+                            color = ElevatedCharcoal,
+                            border = BorderStroke(1.dp, HairlineBorder),
+                            modifier = Modifier.testTag("reset_astro_stretch_button")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(3.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Rounded.RestartAlt,
+                                    contentDescription = null,
+                                    tint = CrispWhite,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Text(
+                                    text = stringResource(R.string.reset),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CrispWhite
+                                )
+                            }
+                        }
+                    }
+
+                    Icon(
+                        imageVector = if (expanded) Icons.Rounded.ExpandMore else Icons.Rounded.ExpandLess,
+                        contentDescription = if (expanded) "Collapse Astro Stretch & Sky" else "Expand Astro Stretch & Sky",
+                        tint = CrispWhite,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+            }
+
+            AnimatedVisibility(
+                visible = expanded,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut()
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 228.dp)
+                        .verticalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp)
+                        .padding(bottom = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    HorizontalDivider(color = HairlineBorder)
+                    ToneSliderRow(
+                        label = "Asinh / Histogram Stretch",
+                        hint = "Reveals faint Milky Way dust & nebulae without blowing star cores",
+                        value = adjustments.asinhStretch,
+                        accentColor = CyanAccent,
+                        testTag = "astro_stretch_slider",
+                        onValueChange = {
+                            onAdjustmentsChange(adjustments.copy(asinhStretch = it))
+                        }
+                    )
+                    ToneSliderRow(
+                        label = "Light Pollution Neutralizer",
+                        hint = "Models & subtracts orange/green skyglow gradients via sky background map",
+                        value = adjustments.lightPollutionRemoval,
+                        accentColor = AmberAccent,
+                        testTag = "astro_light_pollution_slider",
+                        onValueChange = {
+                            onAdjustmentsChange(adjustments.copy(lightPollutionRemoval = it))
+                        }
+                    )
+                    ToneSliderRow(
+                        label = "Chroma Denoise",
+                        hint = "Smooths color blotches in dark shadows while keeping stars pinpoint sharp",
+                        value = adjustments.chromaDenoise,
+                        accentColor = CyanAccent,
+                        testTag = "astro_chroma_denoise_slider",
+                        onValueChange = {
+                            onAdjustmentsChange(adjustments.copy(chromaDenoise = it))
+                        }
+                    )
+                }
+            }
+        }
+    }
+}
+

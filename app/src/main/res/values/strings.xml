@@ -19,11 +19,17 @@
     <string name="hdr_blend_title">HDR Exposure Blend</string>
     <string name="hdr_blend_subtitle">Fuse bracketed exposures with natural highlight roll-off</string>
     <string name="astro_stack_title">Astro / Noise Stack</string>
-    <string name="astro_stack_subtitle">Align starfields &amp; median-stack to suppress sensor noise</string>
+    <string name="astro_stack_subtitle">Align starfields, subtract darks &amp; sigma-stack for clean night skies</string>
     <string name="coming_soon">Coming Soon</string>
     <string name="start_stacking">Start Stacking</string>
     <string name="blend_hdr">Blend HDR</string>
+    <string name="stack_astro">Stack Astro</string>
     <string name="save_full_res">Save Full-Res</string>
     <string name="new_stack">New Stack</string>
     <string name="cancel">Cancel</string>
+    <string name="cd_set_anchor">Set as deghost anchor frame</string>
+    <string name="cd_tag_astro_frame">Tag frame as Light or Dark calibration frame</string>
+    <string name="tone_and_detail">Tone &amp; Detail</string>
+    <string name="astro_stretch_sky">Astro Stretch &amp; Sky</string>
+    <string name="reset">Reset</string>
 </resources>

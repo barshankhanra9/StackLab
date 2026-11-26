@@ -41,7 +41,8 @@ class HdrStackProcessor(
 
         val startTimeMs = System.currentTimeMillis()
         val frameCount = frames.size
-        val refIndex = selectMiddleExposureRefIndex(frames)
+        val refIndex = config.anchorFrameIndex?.takeIf { it in frames.indices }
+            ?: selectMiddleExposureRefIndex(frames)
         val totalSteps = 4
 
         val budget = bitmapLoader.evaluateMemoryBudget(
@@ -54,12 +55,13 @@ class HdrStackProcessor(
             maxEdgePx = budget.effectiveMaxEdgePx
         )
 
+        val refRoleLabel = if (config.deghostingEnabled) "deghost anchor" else "reference"
         onProgress(
             StackProgress(
                 currentStep = 1,
                 totalSteps = totalSteps,
                 fraction = 0.04f,
-                message = "Analyzing middle-exposure reference #${refIndex + 1}..."
+                message = "Analyzing $refRoleLabel frame #${refIndex + 1}..."
             )
         )
 
@@ -173,12 +175,14 @@ class HdrStackProcessor(
                     preallocatedCachePaths[frameIdx] = cacheFile.absolutePath
                     preallocatedPreviews[frameIdx] = OpenCvAlignmentPipeline.createPreviewFromBgrMat(croppedBgr)
 
-                    rawWeight = computeMertensWeightMap(
+                    val unsmoothedWeight = computeMertensWeightMap(
                         bgrMat = croppedBgr,
                         contrastWeight = config.contrastWeight,
                         saturationWeight = config.saturationWeight,
                         exposureWeight = config.exposureWeight
                     )
+                    rawWeight = smoothWeightMapMultiScale(unsmoothedWeight)
+                    unsmoothedWeight.release()
 
                     if (config.deghostingEnabled) {
                         if (stepIdx == 0) {
@@ -321,7 +325,7 @@ class HdrStackProcessor(
             reconstructedFloat.release()
 
             val elapsedMs = System.currentTimeMillis() - startTimeMs
-            val deghostSuffix = if (config.deghostingEnabled) " • Deghost" else ""
+            val deghostSuffix = if (config.deghostingEnabled) " • Anchor #${refIndex + 1} Deghost" else ""
 
             onProgress(
                 StackProgress(
@@ -479,6 +483,52 @@ class HdrStackProcessor(
         Core.multiply(weightAccum, factor, weightAccum)
     }
 
+    /**
+     * Multi-scale Gaussian smoothing of Mertens exposure weight maps before pyramid blending.
+     * Blends fine, medium, and downsampled broad Gaussian scales so abrupt weight transitions
+     * along high-contrast sky-to-mountain boundaries feather smoothly without dark halos.
+     */
+    private fun smoothWeightMapMultiScale(rawWeight: Mat): Mat {
+        val rows = rawWeight.rows()
+        val cols = rawWeight.cols()
+        val minDim = min(rows, cols).toDouble()
+        if (minDim < 32.0) return rawWeight.clone()
+
+        val scaleFine = Mat()
+        val scaleMed = Mat()
+        val down4 = Mat()
+        val down4Blur = Mat()
+        val scaleBroad = Mat()
+        val blended = Mat()
+
+        return try {
+            val sigmaFine = (minDim * 0.003).coerceIn(1.5, 8.0)
+            val sigmaMed = (minDim * 0.010).coerceIn(4.0, 22.0)
+            val sigmaBroadQuarter = (minDim * 0.008).coerceIn(3.5, 18.0) // ~0.032 * minDim at full res
+
+            Imgproc.GaussianBlur(rawWeight, scaleFine, Size(0.0, 0.0), sigmaFine, sigmaFine, Core.BORDER_REFLECT_101)
+            Imgproc.GaussianBlur(rawWeight, scaleMed, Size(0.0, 0.0), sigmaMed, sigmaMed, Core.BORDER_REFLECT_101)
+
+            val qW = (cols / 4).coerceAtLeast(16)
+            val qH = (rows / 4).coerceAtLeast(16)
+            Imgproc.resize(rawWeight, down4, Size(qW.toDouble(), qH.toDouble()), 0.0, 0.0, Imgproc.INTER_AREA)
+            Imgproc.GaussianBlur(down4, down4Blur, Size(0.0, 0.0), sigmaBroadQuarter, sigmaBroadQuarter, Core.BORDER_REFLECT_101)
+            Imgproc.resize(down4Blur, scaleBroad, Size(cols.toDouble(), rows.toDouble()), 0.0, 0.0, Imgproc.INTER_LINEAR)
+
+            Core.addWeighted(scaleFine, 0.25, scaleMed, 0.40, 0.0, blended)
+            Core.addWeighted(blended, 1.0, scaleBroad, 0.35, 0.0, blended)
+            Core.max(blended, Scalar(1e-6), blended)
+            blended.clone()
+        } finally {
+            scaleFine.release()
+            scaleMed.release()
+            down4.release()
+            down4Blur.release()
+            scaleBroad.release()
+            blended.release()
+        }
+    }
+
     private fun computeDeghostingMask(
         srcBgr: Mat,
         refGrayU8: Mat,
@@ -493,6 +543,8 @@ class HdrStackProcessor(
         val validSrc = Mat()
         val validRef = Mat()
         val validBoth = Mat()
+        val dilatedDiff = Mat()
+        val dilateKernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(7.0, 7.0))
         val diffF = Mat()
         val mask = Mat()
 
@@ -512,14 +564,18 @@ class HdrStackProcessor(
             Core.bitwise_and(validSrc, validRef, validBoth)
             Core.bitwise_and(diffU8, validBoth, diffU8)
 
-            diffU8.convertTo(diffF, CvType.CV_32FC1, 1.0 / 255.0)
-            Core.subtract(diffF, Scalar(0.07), diffF)
-            Core.multiply(diffF, Scalar(-1.0 / 0.13), diffF)
+            // Expand motion perimeter slightly so moving subject edges don't leave ghost halos
+            Imgproc.dilate(diffU8, dilatedDiff, dilateKernel)
+
+            dilatedDiff.convertTo(diffF, CvType.CV_32FC1, 1.0 / 255.0)
+            Core.subtract(diffF, Scalar(0.05), diffF)
+            Core.multiply(diffF, Scalar(-1.0 / 0.10), diffF)
             Core.add(diffF, Scalar(1.0), diffF)
             Core.min(diffF, Scalar(1.0), diffF)
-            Core.max(diffF, Scalar(0.01), diffF)
+            Core.max(diffF, Scalar(1e-4), diffF)
 
             Imgproc.GaussianBlur(diffF, mask, Size(15.0, 15.0), 0.0)
+            Core.max(mask, Scalar(1e-4), mask)
             mask.clone()
         } finally {
             srcGray.release()
@@ -530,6 +586,8 @@ class HdrStackProcessor(
             validSrc.release()
             validRef.release()
             validBoth.release()
+            dilatedDiff.release()
+            dilateKernel.release()
             diffF.release()
             mask.release()
         }

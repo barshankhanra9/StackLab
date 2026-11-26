@@ -89,6 +89,7 @@ fun HomeScreen(
     uiState: StackLabUiState,
     onPhotosPicked: (List<android.net.Uri>) -> Unit,
     onHdrModeClicked: () -> Unit,
+    onAstroModeClicked: () -> Unit,
     onComingSoonClicked: (StackMode) -> Unit,
     onSelectResolution: (MaxResolutionPreset) -> Unit,
     onSelectFormat: (OutputFormat) -> Unit,
@@ -256,7 +257,7 @@ fun HomeScreen(
                     .forEach { mode ->
                         val (icon, specsTag) = when (mode) {
                             StackMode.HdrExposureBlend -> Icons.Rounded.Exposure to "EV Bracketing • Mertens Pyramid Fusion"
-                            StackMode.AstroNoiseStack -> Icons.Rounded.NightsStay to "Star Alignment • Sigma Clip"
+                            StackMode.AstroNoiseStack -> Icons.Rounded.NightsStay to "Star Alignment • Sigma Clip • Dark Subtraction"
                             StackMode.FocusStack -> Icons.Rounded.CenterFocusStrong to "Laplacian Pyramid"
                         }
                         SecondaryStackModeCard(
@@ -266,6 +267,7 @@ fun HomeScreen(
                             onClick = {
                                 when {
                                     mode == StackMode.HdrExposureBlend && mode.isAvailable -> onHdrModeClicked()
+                                    mode == StackMode.AstroNoiseStack && mode.isAvailable -> onAstroModeClicked()
                                     else -> onComingSoonClicked(mode)
                                 }
                             }

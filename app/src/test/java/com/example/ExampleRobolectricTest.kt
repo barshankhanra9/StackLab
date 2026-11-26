@@ -6,12 +6,16 @@ import android.graphics.Color
 import android.net.Uri
 import androidx.test.core.app.ApplicationProvider
 import com.example.domain.model.AlignmentMode
+import com.example.domain.model.AstroAlignmentMode
+import com.example.domain.model.AstroFrameType
+import com.example.domain.model.AstroStackAlgorithm
 import com.example.domain.model.BlendAlgorithm
 import com.example.domain.model.FocusRegion
 import com.example.domain.model.RetouchPoint
 import com.example.domain.model.RetouchStroke
 import com.example.domain.model.StackFrame
 import com.example.domain.model.StackMode
+import com.example.engine.AstroStackProcessor
 import com.example.engine.RetouchAndPeakingUtils
 import com.example.ui.StackLabUiState
 import org.junit.Assert.assertEquals
@@ -22,6 +26,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36])
@@ -35,16 +40,59 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `stack modes include active focus and HDR modes and coming soon Astro mode`() {
+    fun `stack modes include active focus HDR and Astro modes`() {
         val state = StackLabUiState()
         assertEquals(3, state.availableModes.size)
         assertTrue(StackMode.FocusStack.isAvailable)
         assertTrue(StackMode.HdrExposureBlend.isAvailable)
-        assertFalse(StackMode.AstroNoiseStack.isAvailable)
+        assertTrue(StackMode.AstroNoiseStack.isAvailable)
         assertEquals(1.0f, state.hdrContrastWeight, 1e-4f)
         assertEquals(1.0f, state.hdrSaturationWeight, 1e-4f)
         assertEquals(1.0f, state.hdrExposureWeight, 1e-4f)
         assertFalse(state.hdrDeghostingEnabled)
+        assertEquals(AstroAlignmentMode.STAR_FIELD, state.astroAlignmentMode)
+        assertEquals(AstroStackAlgorithm.KAPPA_SIGMA, state.astroStackAlgorithm)
+        assertEquals(2.5f, state.astroSigmaThreshold, 1e-4f)
+    }
+
+    @Test
+    fun `astro mode requires at least two enabled light frames regardless of dark frames`() {
+        val oneLightTwoDark = StackLabUiState(
+            activeMode = StackMode.AstroNoiseStack,
+            frames = listOf(
+                StackFrame("l1", Uri.parse("content://media/1"), "light1.jpg", 1920, 1080, astroFrameType = AstroFrameType.LIGHT),
+                StackFrame("d1", Uri.parse("content://media/2"), "dark1.jpg", 1920, 1080, astroFrameType = AstroFrameType.DARK),
+                StackFrame("d2", Uri.parse("content://media/3"), "dark2.jpg", 1920, 1080, astroFrameType = AstroFrameType.DARK)
+            )
+        )
+        assertEquals(1, oneLightTwoDark.enabledLightFramesCount)
+        assertEquals(2, oneLightTwoDark.enabledDarkFramesCount)
+        assertFalse(oneLightTwoDark.canStartStacking)
+
+        val twoLightsOneDark = oneLightTwoDark.copy(
+            frames = oneLightTwoDark.frames + StackFrame(
+                id = "l2",
+                uri = Uri.parse("content://media/4"),
+                displayName = "light2.jpg",
+                width = 1920,
+                height = 1080,
+                astroFrameType = AstroFrameType.LIGHT
+            )
+        )
+        assertEquals(2, twoLightsOneDark.enabledLightFramesCount)
+        assertTrue(twoLightsOneDark.canStartStacking)
+
+        val twoLightsPlusThird = twoLightsOneDark.copy(
+            frames = twoLightsOneDark.frames + StackFrame(
+                id = "l3",
+                uri = Uri.parse("content://media/5"),
+                displayName = "light3.jpg",
+                width = 1920,
+                height = 1080,
+                astroFrameType = AstroFrameType.LIGHT
+            )
+        )
+        assertEquals("l2", AstroStackProcessor.resolveReferenceLightFrameId(twoLightsPlusThird.frames))
     }
 
     @Test
@@ -79,6 +127,7 @@ class ExampleRobolectricTest {
     }
 
     @Test
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
     fun `applyRetouchStroke blends source pixels onto canvas and renders mask`() {
         val canvasBmp = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888).apply {
             eraseColor(Color.BLACK)

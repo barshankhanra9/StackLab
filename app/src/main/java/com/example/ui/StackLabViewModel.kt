@@ -8,9 +8,17 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.MediaStoreExporter
 import com.example.data.SettingsRepository
 import com.example.domain.model.AlignmentMode
+import com.example.domain.model.AstroAlignmentMode
+import com.example.domain.model.AstroConfig
+import com.example.domain.model.AstroFrameType
+import com.example.domain.model.AstroStackAlgorithm
+import com.example.domain.model.AstroStretchAdjustments
 import com.example.domain.model.BlendAlgorithm
 import com.example.domain.model.FocusStackConfig
+import com.example.domain.model.ForegroundMaskStroke
 import com.example.domain.model.HdrConfig
+import com.example.domain.model.HdrStylePreset
+import com.example.domain.model.HdrToneAdjustments
 import com.example.domain.model.MaxResolutionPreset
 import com.example.domain.model.OutputFormat
 import com.example.domain.model.OutputSettings
@@ -20,12 +28,17 @@ import com.example.domain.model.StackFrame
 import com.example.domain.model.StackMode
 import com.example.domain.model.StackProgress
 import com.example.domain.model.StackResult
+import com.example.engine.AstroPostEngine
+import com.example.engine.AstroStackProcessor
 import com.example.engine.EvFrameAnalyzer
 import com.example.engine.FocusFrameAnalyzer
 import com.example.engine.FocusStackProcessor
 import com.example.engine.FrameBitmapLoader
 import com.example.engine.HdrStackProcessor
+import com.example.engine.HdrToneEngine
 import com.example.engine.RetouchAndPeakingUtils
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -69,6 +82,16 @@ data class StackLabUiState(
     val hdrSaturationWeight: Float = 1.0f,
     val hdrExposureWeight: Float = 1.0f,
     val hdrDeghostingEnabled: Boolean = false,
+    val selectedHdrPreset: HdrStylePreset? = HdrStylePreset.NATURAL,
+    val hdrAnchorFrameId: String? = null,
+    val hdrToneAdjustments: HdrToneAdjustments = HdrToneAdjustments(),
+    val astroAlignmentMode: AstroAlignmentMode = AstroAlignmentMode.STAR_FIELD,
+    val astroStackAlgorithm: AstroStackAlgorithm = AstroStackAlgorithm.KAPPA_SIGMA,
+    val astroSigmaThreshold: Float = 2.5f,
+    val astroFreezeGroundEnabled: Boolean = false,
+    val astroFreezeGroundStrokes: List<ForegroundMaskStroke> = emptyList(),
+    val astroStretchAdjustments: AstroStretchAdjustments = AstroStretchAdjustments(),
+    val isApplyingTone: Boolean = false,
     val processingState: ProcessingUiState = ProcessingUiState.Idle,
     val result: StackResult? = null,
     val retouchBitmapVersion: Int = 0,
@@ -92,8 +115,19 @@ data class StackLabUiState(
     val enabledFramesCount: Int
         get() = frames.count { it.isEnabled }
 
+    val enabledLightFramesCount: Int
+        get() = frames.count { it.isEnabled && it.astroFrameType == AstroFrameType.LIGHT }
+
+    val enabledDarkFramesCount: Int
+        get() = frames.count { it.isEnabled && it.astroFrameType == AstroFrameType.DARK }
+
     val canStartStacking: Boolean
-        get() = enabledFramesCount >= 2 && processingState is ProcessingUiState.Idle
+        get() = processingState is ProcessingUiState.Idle &&
+            if (activeMode == StackMode.AstroNoiseStack) {
+                enabledLightFramesCount >= 2
+            } else {
+                enabledFramesCount >= 2
+            }
 }
 
 class StackLabViewModel(application: Application) : AndroidViewModel(application) {
@@ -104,6 +138,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     private val evAnalyzer = EvFrameAnalyzer(bitmapLoader)
     private val focusStackProcessor = FocusStackProcessor(bitmapLoader)
     private val hdrStackProcessor = HdrStackProcessor(bitmapLoader)
+    private val astroStackProcessor = AstroStackProcessor(bitmapLoader)
     private val mediaStoreExporter = MediaStoreExporter(application)
 
     private val _uiState = MutableStateFlow(StackLabUiState())
@@ -115,10 +150,12 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     private var stackingJob: Job? = null
     private var analysisJob: Job? = null
     private var peakingJob: Job? = null
+    private var toneJob: Job? = null
 
-    // Retouch session buffers (kept strictly O(1) — only 1 active source frame in RAM)
+    // Retouch & post-fusion tone session buffers (kept strictly O(1) — only 1 active source frame in RAM)
     private var baseOutputBitmap: Bitmap? = null
     private var workingOutputBitmap: Bitmap? = null
+    private var tonePreviewBaseBitmap: Bitmap? = null
     private var activeRetouchSourceIndex: Int = -1
     private var activeRetouchSourceBitmap: Bitmap? = null
     private val undoStrokes = ArrayList<RetouchStroke>()
@@ -144,6 +181,28 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 activeMode = StackMode.HdrExposureBlend,
                 frames = if (switchingFromOtherMode) emptyList() else state.frames,
                 selectedPreviewIndex = if (switchingFromOtherMode) 0 else state.selectedPreviewIndex,
+                astroFreezeGroundStrokes = if (switchingFromOtherMode) emptyList() else state.astroFreezeGroundStrokes,
+                result = if (switchingFromOtherMode) null else state.result,
+                lastSavedPath = null
+            )
+        }
+        _navEvents.tryEmit(StackLabNavEvent.OpenWorkspace)
+    }
+
+    fun openAstroWorkspace() {
+        analysisJob?.cancel()
+        val switchingFromOtherMode = _uiState.value.activeMode != StackMode.AstroNoiseStack
+        if (switchingFromOtherMode) {
+            clearRetouchAndPeakingState()
+            recycleResultBitmaps(_uiState.value.result)
+        }
+        _uiState.update { state ->
+            state.copy(
+                activeMode = StackMode.AstroNoiseStack,
+                frames = if (switchingFromOtherMode) emptyList() else state.frames,
+                selectedPreviewIndex = if (switchingFromOtherMode) 0 else state.selectedPreviewIndex,
+                hdrAnchorFrameId = if (switchingFromOtherMode) null else state.hdrAnchorFrameId,
+                astroFreezeGroundStrokes = if (switchingFromOtherMode) emptyList() else state.astroFreezeGroundStrokes,
                 result = if (switchingFromOtherMode) null else state.result,
                 lastSavedPath = null
             )
@@ -172,9 +231,19 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 }
                 mergedFrames = merged
                 resolvedMode = targetMode
+                val nextAnchorId = if (targetMode == StackMode.HdrExposureBlend) {
+                    if (state.hdrAnchorFrameId != null && merged.any { it.id == state.hdrAnchorFrameId && it.isEnabled }) {
+                        state.hdrAnchorFrameId
+                    } else {
+                        resolveMiddleExposureFrameId(merged)
+                    }
+                } else {
+                    null
+                }
                 state.copy(
                     activeMode = targetMode,
                     frames = merged,
+                    hdrAnchorFrameId = nextAnchorId,
                     selectedPreviewIndex = state.selectedPreviewIndex.coerceIn(
                         0,
                         (merged.size - 1).coerceAtLeast(0)
@@ -185,10 +254,10 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             if (navigateToWorkspace) {
                 _navEvents.tryEmit(StackLabNavEvent.OpenWorkspace)
             }
-            if (resolvedMode == StackMode.HdrExposureBlend) {
-                runEvAnalysis(mergedFrames, autoSort = true)
-            } else {
-                runFocusAnalysis(mergedFrames)
+            when (resolvedMode) {
+                StackMode.HdrExposureBlend -> runEvAnalysis(mergedFrames, autoSort = true)
+                StackMode.FocusStack -> runFocusAnalysis(mergedFrames)
+                StackMode.AstroNoiseStack -> Unit // Light frames by default; no focus/EV pre-analysis needed
             }
         }
     }
@@ -262,9 +331,18 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                         finalFrames.indexOfFirst { it.id == id }.takeIf { it >= 0 }
                     } ?: state.selectedPreviewIndex.coerceIn(0, (finalFrames.size - 1).coerceAtLeast(0))
 
+                    val anchorStillValid = state.hdrAnchorFrameId != null &&
+                        finalFrames.any { it.id == state.hdrAnchorFrameId && it.isEnabled }
+                    val nextAnchorId = if (anchorStillValid) {
+                        state.hdrAnchorFrameId
+                    } else {
+                        resolveMiddleExposureFrameId(finalFrames)
+                    }
+
                     state.copy(
                         isAnalyzingFocus = false,
                         frames = finalFrames,
+                        hdrAnchorFrameId = nextAnchorId,
                         selectedPreviewIndex = nextSelected
                     )
                 }
@@ -282,7 +360,45 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             val updated = state.frames.toMutableList()
             val target = updated[index]
             updated[index] = target.copy(isEnabled = !target.isEnabled)
-            state.copy(frames = updated)
+            val nextAnchorId = if (state.activeMode == StackMode.HdrExposureBlend) {
+                if (state.hdrAnchorFrameId != null && updated.any { it.id == state.hdrAnchorFrameId && it.isEnabled }) {
+                    state.hdrAnchorFrameId
+                } else {
+                    resolveMiddleExposureFrameId(updated)
+                }
+            } else {
+                state.hdrAnchorFrameId
+            }
+            state.copy(frames = updated, hdrAnchorFrameId = nextAnchorId)
+        }
+    }
+
+    fun selectHdrAnchorFrame(index: Int) {
+        _uiState.update { state ->
+            val target = state.frames.getOrNull(index) ?: return@update state
+            val updated = if (target.isEnabled) {
+                state.frames
+            } else {
+                state.frames.toMutableList().apply {
+                    set(index, target.copy(isEnabled = true))
+                }
+            }
+            state.copy(
+                frames = updated,
+                hdrAnchorFrameId = target.id,
+                snackbarMessage = "Anchor set to frame #${index + 1}"
+            )
+        }
+    }
+
+    private fun resolveMiddleExposureFrameId(frames: List<StackFrame>): String? {
+        if (frames.isEmpty()) return null
+        val pool = frames.filter { it.isEnabled }.ifEmpty { frames }
+        return if (pool.any { it.isAnalyzed }) {
+            val sorted = pool.sortedBy { it.meanLuminance }
+            sorted[sorted.size / 2].id
+        } else {
+            pool[pool.size / 2].id
         }
     }
 
@@ -338,14 +454,23 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             if (index !in state.frames.indices) return@update state
             val updated = state.frames.toMutableList().apply { removeAt(index) }
             val nextPreview = if (updated.isEmpty()) 0 else state.selectedPreviewIndex.coerceAtMost(updated.lastIndex)
-            state.copy(frames = updated, selectedPreviewIndex = nextPreview)
+            val nextAnchorId = if (state.activeMode == StackMode.HdrExposureBlend) {
+                if (state.hdrAnchorFrameId != null && updated.any { it.id == state.hdrAnchorFrameId && it.isEnabled }) {
+                    state.hdrAnchorFrameId
+                } else {
+                    resolveMiddleExposureFrameId(updated)
+                }
+            } else {
+                state.hdrAnchorFrameId
+            }
+            state.copy(frames = updated, selectedPreviewIndex = nextPreview, hdrAnchorFrameId = nextAnchorId)
         }
         val stateAfter = _uiState.value
         if (stateAfter.frames.isNotEmpty()) {
-            if (stateAfter.activeMode == StackMode.HdrExposureBlend) {
-                runEvAnalysis(stateAfter.frames, autoSort = false)
-            } else {
-                runFocusAnalysis(stateAfter.frames)
+            when (stateAfter.activeMode) {
+                StackMode.HdrExposureBlend -> runEvAnalysis(stateAfter.frames, autoSort = false)
+                StackMode.FocusStack -> runFocusAnalysis(stateAfter.frames)
+                StackMode.AstroNoiseStack -> Unit
             }
         }
     }
@@ -384,20 +509,132 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(autoCropBorders = enabled) }
     }
 
+    fun selectHdrPreset(preset: HdrStylePreset) {
+        _uiState.update {
+            it.copy(
+                selectedHdrPreset = preset,
+                hdrContrastWeight = preset.contrastWeight,
+                hdrSaturationWeight = preset.saturationWeight,
+                hdrExposureWeight = preset.exposureWeight
+            )
+        }
+    }
+
     fun setHdrContrastWeight(weight: Float) {
-        _uiState.update { it.copy(hdrContrastWeight = weight.coerceIn(0f, 2f)) }
+        _uiState.update { state ->
+            val clamped = weight.coerceIn(0f, 2f)
+            state.copy(
+                hdrContrastWeight = clamped,
+                selectedHdrPreset = findMatchingHdrPreset(
+                    clamped,
+                    state.hdrSaturationWeight,
+                    state.hdrExposureWeight
+                )
+            )
+        }
     }
 
     fun setHdrSaturationWeight(weight: Float) {
-        _uiState.update { it.copy(hdrSaturationWeight = weight.coerceIn(0f, 2f)) }
+        _uiState.update { state ->
+            val clamped = weight.coerceIn(0f, 2f)
+            state.copy(
+                hdrSaturationWeight = clamped,
+                selectedHdrPreset = findMatchingHdrPreset(
+                    state.hdrContrastWeight,
+                    clamped,
+                    state.hdrExposureWeight
+                )
+            )
+        }
     }
 
     fun setHdrExposureWeight(weight: Float) {
-        _uiState.update { it.copy(hdrExposureWeight = weight.coerceIn(0f, 2f)) }
+        _uiState.update { state ->
+            val clamped = weight.coerceIn(0f, 2f)
+            state.copy(
+                hdrExposureWeight = clamped,
+                selectedHdrPreset = findMatchingHdrPreset(
+                    state.hdrContrastWeight,
+                    state.hdrSaturationWeight,
+                    clamped
+                )
+            )
+        }
+    }
+
+    private fun findMatchingHdrPreset(c: Float, s: Float, e: Float): HdrStylePreset? {
+        return HdrStylePreset.entries.firstOrNull { preset ->
+            abs(preset.contrastWeight - c) < 0.02f &&
+                abs(preset.saturationWeight - s) < 0.02f &&
+                abs(preset.exposureWeight - e) < 0.02f
+        }
     }
 
     fun setHdrDeghostingEnabled(enabled: Boolean) {
         _uiState.update { it.copy(hdrDeghostingEnabled = enabled) }
+    }
+
+    // --- Astro & Low-Light Calibration & Settings ---
+
+    fun setAstroFrameType(index: Int, frameType: AstroFrameType) {
+        _uiState.update { state ->
+            if (index !in state.frames.indices) return@update state
+            val updated = state.frames.toMutableList()
+            updated[index] = updated[index].copy(astroFrameType = frameType)
+            state.copy(frames = updated)
+        }
+    }
+
+    fun sortAstroFramesLightsFirst() {
+        val current = _uiState.value
+        if (current.frames.size < 2) return
+        val selectedId = current.frames.getOrNull(current.selectedPreviewIndex)?.id
+        val sorted = current.frames.sortedBy { it.astroFrameType.ordinal }
+        val newSelectedIdx = selectedId?.let { id ->
+            sorted.indexOfFirst { it.id == id }.takeIf { it >= 0 }
+        } ?: 0
+        _uiState.update {
+            it.copy(
+                frames = sorted,
+                selectedPreviewIndex = newSelectedIdx,
+                snackbarMessage = "Sorted Light frames first, Dark frames last"
+            )
+        }
+    }
+
+    fun setAstroAlignmentMode(mode: AstroAlignmentMode) {
+        _uiState.update { it.copy(astroAlignmentMode = mode) }
+    }
+
+    fun setAstroStackAlgorithm(algorithm: AstroStackAlgorithm) {
+        _uiState.update { it.copy(astroStackAlgorithm = algorithm) }
+    }
+
+    fun setAstroSigmaThreshold(sigma: Float) {
+        val stepped = ((sigma * 10f).roundToInt() / 10f).coerceIn(1.2f, 4.5f)
+        _uiState.update { it.copy(astroSigmaThreshold = stepped) }
+    }
+
+    fun setAstroFreezeGroundEnabled(enabled: Boolean) {
+        _uiState.update { it.copy(astroFreezeGroundEnabled = enabled) }
+    }
+
+    fun addAstroFreezeGroundStroke(stroke: ForegroundMaskStroke) {
+        if (stroke.points.isEmpty()) return
+        _uiState.update { state ->
+            state.copy(astroFreezeGroundStrokes = state.astroFreezeGroundStrokes + stroke)
+        }
+    }
+
+    fun undoAstroFreezeGroundStroke() {
+        _uiState.update { state ->
+            if (state.astroFreezeGroundStrokes.isEmpty()) state
+            else state.copy(astroFreezeGroundStrokes = state.astroFreezeGroundStrokes.dropLast(1))
+        }
+    }
+
+    fun clearAstroFreezeGroundStrokes() {
+        _uiState.update { it.copy(astroFreezeGroundStrokes = emptyList()) }
     }
 
     fun updateMaxResolution(preset: MaxResolutionPreset) {
@@ -419,7 +656,13 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
     fun startStacking() {
         val current = _uiState.value
         val activeFrames = current.frames.filter { it.isEnabled }
-        if (activeFrames.size < 2) {
+        if (current.activeMode == StackMode.AstroNoiseStack) {
+            val activeLights = activeFrames.count { it.astroFrameType == AstroFrameType.LIGHT }
+            if (activeLights < 2) {
+                postMessage("Enable at least 2 Light frames to stack (Dark frames are optional).")
+                return
+            }
+        } else if (activeFrames.size < 2) {
             val noun = if (current.activeMode == StackMode.HdrExposureBlend) "bracketed frames" else "frames"
             postMessage("Enable at least 2 $noun to process.")
             return
@@ -428,10 +671,10 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
         stackingJob?.cancel()
         stackingJob = viewModelScope.launch(Dispatchers.Default) {
-            val initMsg = if (current.activeMode == StackMode.HdrExposureBlend) {
-                "Initializing Mertens HDR exposure fusion..."
-            } else {
-                "Initializing OpenCV darkroom engine..."
+            val initMsg = when (current.activeMode) {
+                StackMode.HdrExposureBlend -> "Initializing Mertens HDR exposure fusion..."
+                StackMode.AstroNoiseStack -> "Initializing Astro calibration & alignment engine..."
+                StackMode.FocusStack -> "Initializing OpenCV darkroom engine..."
             }
             _uiState.update {
                 it.copy(
@@ -449,34 +692,57 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     }
                 }
 
-                val result = if (current.activeMode == StackMode.HdrExposureBlend) {
-                    val hdrConfig = HdrConfig(
-                        alignmentMode = current.alignmentMode,
-                        contrastWeight = current.hdrContrastWeight,
-                        saturationWeight = current.hdrSaturationWeight,
-                        exposureWeight = current.hdrExposureWeight,
-                        deghostingEnabled = current.hdrDeghostingEnabled,
-                        autoCropBorders = current.autoCropBorders,
-                        outputSettings = current.outputSettings
-                    )
-                    hdrStackProcessor.process(
-                        frames = activeFrames,
-                        config = hdrConfig,
-                        onProgress = onProgress
-                    )
-                } else {
-                    val focusConfig = FocusStackConfig(
-                        alignmentMode = current.alignmentMode,
-                        blendAlgorithm = current.blendAlgorithm,
-                        edgeSmoothingRadius = current.edgeSmoothingRadius,
-                        autoCropBorders = current.autoCropBorders,
-                        outputSettings = current.outputSettings
-                    )
-                    focusStackProcessor.process(
-                        frames = activeFrames,
-                        config = focusConfig,
-                        onProgress = onProgress
-                    )
+                val result = when (current.activeMode) {
+                    StackMode.HdrExposureBlend -> {
+                        val resolvedAnchorIdx = current.hdrAnchorFrameId?.let { id ->
+                            activeFrames.indexOfFirst { it.id == id }.takeIf { it >= 0 }
+                        }
+                        val hdrConfig = HdrConfig(
+                            alignmentMode = current.alignmentMode,
+                            contrastWeight = current.hdrContrastWeight,
+                            saturationWeight = current.hdrSaturationWeight,
+                            exposureWeight = current.hdrExposureWeight,
+                            deghostingEnabled = current.hdrDeghostingEnabled,
+                            anchorFrameIndex = resolvedAnchorIdx,
+                            autoCropBorders = current.autoCropBorders,
+                            outputSettings = current.outputSettings
+                        )
+                        hdrStackProcessor.process(
+                            frames = activeFrames,
+                            config = hdrConfig,
+                            onProgress = onProgress
+                        )
+                    }
+                    StackMode.AstroNoiseStack -> {
+                        val astroConfig = AstroConfig(
+                            alignmentMode = current.astroAlignmentMode,
+                            stackAlgorithm = current.astroStackAlgorithm,
+                            sigmaClippingThreshold = current.astroSigmaThreshold,
+                            freezeGroundEnabled = current.astroFreezeGroundEnabled,
+                            freezeGroundStrokes = current.astroFreezeGroundStrokes,
+                            autoCropBorders = current.autoCropBorders,
+                            outputSettings = current.outputSettings
+                        )
+                        astroStackProcessor.process(
+                            frames = activeFrames,
+                            config = astroConfig,
+                            onProgress = onProgress
+                        )
+                    }
+                    StackMode.FocusStack -> {
+                        val focusConfig = FocusStackConfig(
+                            alignmentMode = current.alignmentMode,
+                            blendAlgorithm = current.blendAlgorithm,
+                            edgeSmoothingRadius = current.edgeSmoothingRadius,
+                            autoCropBorders = current.autoCropBorders,
+                            outputSettings = current.outputSettings
+                        )
+                        focusStackProcessor.process(
+                            frames = activeFrames,
+                            config = focusConfig,
+                            onProgress = onProgress
+                        )
+                    }
                 }
 
                 clearRetouchAndPeakingState()
@@ -484,14 +750,41 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 baseOutputBitmap = result.outputBitmap.copy(Bitmap.Config.ARGB_8888, false)
                 workingOutputBitmap = result.outputBitmap
 
+                val initialTone = if (result.stackMode == StackMode.HdrExposureBlend) {
+                    current.selectedHdrPreset?.defaultTone ?: HdrToneAdjustments()
+                } else {
+                    HdrToneAdjustments()
+                }
+                val initialAstroStretch = AstroStretchAdjustments()
+                val previewBase = when (result.stackMode) {
+                    StackMode.HdrExposureBlend -> HdrToneEngine.createFastPreviewBase(result.outputBitmap)
+                    StackMode.AstroNoiseStack -> AstroPostEngine.createFastPreviewBase(result.outputBitmap)
+                    StackMode.FocusStack -> null
+                }
+                tonePreviewBaseBitmap = previewBase
+
+                val finalDisplayResult = if (
+                    result.stackMode == StackMode.HdrExposureBlend &&
+                    previewBase != null &&
+                    !initialTone.isIdentity()
+                ) {
+                    val tonedPreview = HdrToneEngine.applyToneAndClarity(previewBase, initialTone)
+                    result.copy(outputBitmap = tonedPreview)
+                } else {
+                    result
+                }
+
                 _uiState.update {
                     it.copy(
                         processingState = ProcessingUiState.Idle,
-                        result = result,
+                        result = finalDisplayResult,
+                        hdrToneAdjustments = initialTone,
+                        astroStretchAdjustments = initialAstroStretch,
+                        isApplyingTone = false,
                         retouchBitmapVersion = 1,
-                        retouchSourceIndex = result.defaultComparisonIndex.coerceIn(
+                        retouchSourceIndex = finalDisplayResult.defaultComparisonIndex.coerceIn(
                             0,
-                            (result.sourcePreviewBitmaps.size - 1).coerceAtLeast(0)
+                            (finalDisplayResult.sourcePreviewBitmaps.size - 1).coerceAtLeast(0)
                         ),
                         lastSavedPath = null
                     )
@@ -561,7 +854,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _uiState.update { it.copy(isApplyingRetouch = true) }
             try {
-                val (updatedBitmap, newMask, newPeaking) = withContext(Dispatchers.Default) {
+                val (displayBitmap, newMask, newPeaking) = withContext(Dispatchers.Default) {
                     val working = ensureMutableWorkingBitmap(result.outputBitmap)
                     val sourceBmp = loadOrGetActiveRetouchSource(result, stroke.sourceFrameIndex)
                     RetouchAndPeakingUtils.applyRetouchStroke(working, sourceBmp, stroke)
@@ -569,23 +862,25 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     undoStrokes.add(stroke)
                     redoStrokes.clear()
 
+                    val display = refreshPreviewAndApplyTone(working, result.stackMode, _uiState.value.hdrToneAdjustments)
+
                     val mask = RetouchAndPeakingUtils.renderRetouchMaskOverlay(
                         width = working.width,
                         height = working.height,
                         strokes = undoStrokes
                     )
                     val peaking = if (_uiState.value.isFocusPeakingEnabled) {
-                        RetouchAndPeakingUtils.generateFocusPeakingOverlay(working)
+                        RetouchAndPeakingUtils.generateFocusPeakingOverlay(display)
                     } else null
 
-                    Triple(working, mask, peaking)
+                    Triple(display, mask, peaking)
                 }
 
                 val oldMask = _uiState.value.retouchMaskBitmap
                 val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
                 _uiState.update { current ->
                     current.copy(
-                        result = current.result?.copy(outputBitmap = updatedBitmap),
+                        result = current.result?.copy(outputBitmap = displayBitmap),
                         retouchBitmapVersion = current.retouchBitmapVersion + 1,
                         retouchUndoCount = undoStrokes.size,
                         retouchRedoCount = 0,
@@ -617,7 +912,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
         viewModelScope.launch {
             _uiState.update { it.copy(isApplyingRetouch = true) }
-            val (rebuiltBitmap, newMask, newPeaking) = withContext(Dispatchers.Default) {
+            val (rebuiltDisplay, newMask, newPeaking) = withContext(Dispatchers.Default) {
                 val popped = undoStrokes.removeAt(undoStrokes.lastIndex)
                 redoStrokes.add(popped)
 
@@ -629,6 +924,8 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 }
                 workingOutputBitmap = freshWorking
 
+                val display = refreshPreviewAndApplyTone(freshWorking, result.stackMode, _uiState.value.hdrToneAdjustments)
+
                 val mask = if (undoStrokes.isNotEmpty()) {
                     RetouchAndPeakingUtils.renderRetouchMaskOverlay(
                         width = freshWorking.width,
@@ -638,18 +935,17 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 } else null
 
                 val peaking = if (_uiState.value.isFocusPeakingEnabled) {
-                    RetouchAndPeakingUtils.generateFocusPeakingOverlay(freshWorking)
+                    RetouchAndPeakingUtils.generateFocusPeakingOverlay(display)
                 } else null
 
-                Triple(freshWorking, mask, peaking)
+                Triple(display, mask, peaking)
             }
 
-            val oldWorking = result.outputBitmap
             val oldMask = _uiState.value.retouchMaskBitmap
             val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
             _uiState.update { current ->
                 current.copy(
-                    result = current.result?.copy(outputBitmap = rebuiltBitmap),
+                    result = current.result?.copy(outputBitmap = rebuiltDisplay),
                     retouchBitmapVersion = current.retouchBitmapVersion + 1,
                     retouchUndoCount = undoStrokes.size,
                     retouchRedoCount = redoStrokes.size,
@@ -658,9 +954,6 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     isApplyingRetouch = false,
                     lastSavedPath = null
                 )
-            }
-            if (oldWorking !== baseOutputBitmap && oldWorking !== rebuiltBitmap && !oldWorking.isRecycled) {
-                oldWorking.recycle()
             }
             if (oldMask != null && oldMask !== newMask && !oldMask.isRecycled) oldMask.recycle()
             if (newPeaking != null && oldPeaking != null && oldPeaking !== newPeaking && !oldPeaking.isRecycled) {
@@ -676,12 +969,14 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
         viewModelScope.launch {
             _uiState.update { it.copy(isApplyingRetouch = true) }
-            val (updatedBitmap, newMask, newPeaking) = withContext(Dispatchers.Default) {
+            val (displayBitmap, newMask, newPeaking) = withContext(Dispatchers.Default) {
                 val stroke = redoStrokes.removeAt(redoStrokes.lastIndex)
                 val working = ensureMutableWorkingBitmap(result.outputBitmap)
                 val src = loadOrGetActiveRetouchSource(result, stroke.sourceFrameIndex)
                 RetouchAndPeakingUtils.applyRetouchStroke(working, src, stroke)
                 undoStrokes.add(stroke)
+
+                val display = refreshPreviewAndApplyTone(working, result.stackMode, _uiState.value.hdrToneAdjustments)
 
                 val mask = RetouchAndPeakingUtils.renderRetouchMaskOverlay(
                     width = working.width,
@@ -689,17 +984,17 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                     strokes = undoStrokes
                 )
                 val peaking = if (_uiState.value.isFocusPeakingEnabled) {
-                    RetouchAndPeakingUtils.generateFocusPeakingOverlay(working)
+                    RetouchAndPeakingUtils.generateFocusPeakingOverlay(display)
                 } else null
 
-                Triple(working, mask, peaking)
+                Triple(display, mask, peaking)
             }
 
             val oldMask = _uiState.value.retouchMaskBitmap
             val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
             _uiState.update { current ->
                 current.copy(
-                    result = current.result?.copy(outputBitmap = updatedBitmap),
+                    result = current.result?.copy(outputBitmap = displayBitmap),
                     retouchBitmapVersion = current.retouchBitmapVersion + 1,
                     retouchUndoCount = undoStrokes.size,
                     retouchRedoCount = redoStrokes.size,
@@ -818,6 +1113,190 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    private fun refreshPreviewAndApplyTone(
+        fullResWorking: Bitmap,
+        stackMode: StackMode,
+        toneAdjustments: HdrToneAdjustments
+    ): Bitmap {
+        return when (stackMode) {
+            StackMode.FocusStack -> fullResWorking
+            StackMode.HdrExposureBlend -> {
+                val oldPreviewBase = tonePreviewBaseBitmap
+                val newPreviewBase = HdrToneEngine.createFastPreviewBase(fullResWorking)
+                tonePreviewBaseBitmap = newPreviewBase
+                if (oldPreviewBase != null &&
+                    oldPreviewBase !== fullResWorking &&
+                    oldPreviewBase !== newPreviewBase &&
+                    !oldPreviewBase.isRecycled
+                ) {
+                    oldPreviewBase.recycle()
+                }
+                if (toneAdjustments.isIdentity()) {
+                    newPreviewBase
+                } else {
+                    HdrToneEngine.applyToneAndClarity(newPreviewBase, toneAdjustments)
+                }
+            }
+            StackMode.AstroNoiseStack -> {
+                val oldPreviewBase = tonePreviewBaseBitmap
+                val newPreviewBase = AstroPostEngine.createFastPreviewBase(fullResWorking)
+                tonePreviewBaseBitmap = newPreviewBase
+                if (oldPreviewBase != null &&
+                    oldPreviewBase !== fullResWorking &&
+                    oldPreviewBase !== newPreviewBase &&
+                    !oldPreviewBase.isRecycled
+                ) {
+                    oldPreviewBase.recycle()
+                }
+                val astroStretch = _uiState.value.astroStretchAdjustments
+                if (astroStretch.isIdentity()) {
+                    newPreviewBase
+                } else {
+                    AstroPostEngine.applyPostProcessing(newPreviewBase, astroStretch)
+                }
+            }
+        }
+    }
+
+    // --- Post-Fusion Tone & Clarity Engine ---
+
+    fun updateHdrToneAdjustments(adjustments: HdrToneAdjustments) {
+        val result = _uiState.value.result ?: return
+        if (result.stackMode != StackMode.HdrExposureBlend) return
+
+        val clamped = HdrToneAdjustments(
+            highlightRecovery = adjustments.highlightRecovery.coerceIn(0f, 1f),
+            shadowLift = adjustments.shadowLift.coerceIn(0f, 1f),
+            clarity = adjustments.clarity.coerceIn(0f, 1f),
+            vibrance = adjustments.vibrance.coerceIn(0f, 1f)
+        )
+
+        _uiState.update {
+            it.copy(
+                hdrToneAdjustments = clamped,
+                isApplyingTone = true,
+                lastSavedPath = null
+            )
+        }
+
+        toneJob?.cancel()
+        toneJob = viewModelScope.launch {
+            try {
+                val previewBase = tonePreviewBaseBitmap ?: run {
+                    val src = workingOutputBitmap ?: baseOutputBitmap ?: result.outputBitmap
+                    HdrToneEngine.createFastPreviewBase(src).also { tonePreviewBaseBitmap = it }
+                }
+
+                val (updatedDisplay, updatedPeaking) = withContext(Dispatchers.Default) {
+                    val bmp = if (clamped.isIdentity()) {
+                        previewBase
+                    } else {
+                        HdrToneEngine.applyToneAndClarity(previewBase, clamped)
+                    }
+                    val peaking = if (_uiState.value.isFocusPeakingEnabled) {
+                        RetouchAndPeakingUtils.generateFocusPeakingOverlay(bmp)
+                    } else null
+                    bmp to peaking
+                }
+
+                val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
+                _uiState.update { current ->
+                    current.copy(
+                        result = current.result?.copy(outputBitmap = updatedDisplay),
+                        retouchBitmapVersion = current.retouchBitmapVersion + 1,
+                        focusPeakingOverlayBitmap = updatedPeaking ?: current.focusPeakingOverlayBitmap,
+                        isApplyingTone = false
+                    )
+                }
+                if (updatedPeaking != null && oldPeaking != null && oldPeaking !== updatedPeaking && !oldPeaking.isRecycled) {
+                    oldPeaking.recycle()
+                }
+            } catch (_: CancellationException) {
+                // Superseded by newer slider tick
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isApplyingTone = false,
+                        snackbarMessage = "Tone update failed: ${t.message ?: "Unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun resetHdrToneAdjustments() {
+        updateHdrToneAdjustments(HdrToneAdjustments())
+    }
+
+    // --- Post-Stack Astro Stretch & Sky Engine ---
+
+    fun updateAstroStretchAdjustments(adjustments: AstroStretchAdjustments) {
+        val result = _uiState.value.result ?: return
+        if (result.stackMode != StackMode.AstroNoiseStack) return
+
+        val clamped = AstroStretchAdjustments(
+            asinhStretch = adjustments.asinhStretch.coerceIn(0f, 1f),
+            lightPollutionRemoval = adjustments.lightPollutionRemoval.coerceIn(0f, 1f),
+            chromaDenoise = adjustments.chromaDenoise.coerceIn(0f, 1f)
+        )
+
+        _uiState.update {
+            it.copy(
+                astroStretchAdjustments = clamped,
+                isApplyingTone = true,
+                lastSavedPath = null
+            )
+        }
+
+        toneJob?.cancel()
+        toneJob = viewModelScope.launch {
+            try {
+                val previewBase = tonePreviewBaseBitmap ?: run {
+                    val src = workingOutputBitmap ?: baseOutputBitmap ?: result.outputBitmap
+                    AstroPostEngine.createFastPreviewBase(src).also { tonePreviewBaseBitmap = it }
+                }
+
+                val (updatedDisplay, updatedPeaking) = withContext(Dispatchers.Default) {
+                    val bmp = if (clamped.isIdentity()) {
+                        previewBase
+                    } else {
+                        AstroPostEngine.applyPostProcessing(previewBase, clamped)
+                    }
+                    val peaking = if (_uiState.value.isFocusPeakingEnabled) {
+                        RetouchAndPeakingUtils.generateFocusPeakingOverlay(bmp)
+                    } else null
+                    bmp to peaking
+                }
+
+                val oldPeaking = _uiState.value.focusPeakingOverlayBitmap
+                _uiState.update { current ->
+                    current.copy(
+                        result = current.result?.copy(outputBitmap = updatedDisplay),
+                        retouchBitmapVersion = current.retouchBitmapVersion + 1,
+                        focusPeakingOverlayBitmap = updatedPeaking ?: current.focusPeakingOverlayBitmap,
+                        isApplyingTone = false
+                    )
+                }
+                if (updatedPeaking != null && oldPeaking != null && oldPeaking !== updatedPeaking && !oldPeaking.isRecycled) {
+                    oldPeaking.recycle()
+                }
+            } catch (_: CancellationException) {
+                // Superseded by newer slider tick
+            } catch (t: Throwable) {
+                _uiState.update {
+                    it.copy(
+                        isApplyingTone = false,
+                        snackbarMessage = "Astro stretch failed: ${t.message ?: "Unknown error"}"
+                    )
+                }
+            }
+        }
+    }
+
+    fun resetAstroStretchAdjustments() {
+        updateAstroStretchAdjustments(AstroStretchAdjustments())
+    }
+
     fun saveFullResolutionResult() {
         val state = _uiState.value
         val result = state.result ?: return
@@ -826,11 +1305,39 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             _uiState.update { it.copy(isSaving = true) }
             try {
-                val outcome = mediaStoreExporter.saveToGallery(
-                    bitmap = result.outputBitmap,
-                    settings = state.outputSettings,
-                    referenceFrameUri = result.referenceFrameUri
-                )
+                val outcome = withContext(Dispatchers.Default) {
+                    val fullResBase = workingOutputBitmap?.takeIf { !it.isRecycled }
+                        ?: baseOutputBitmap?.takeIf { !it.isRecycled }
+                        ?: result.outputBitmap
+
+                    val needsFullResHdrTone = result.stackMode == StackMode.HdrExposureBlend &&
+                        !state.hdrToneAdjustments.isIdentity()
+                    val needsFullResAstroPost = result.stackMode == StackMode.AstroNoiseStack &&
+                        !state.astroStretchAdjustments.isIdentity()
+
+                    val exportBitmap = when {
+                        needsFullResHdrTone ->
+                            HdrToneEngine.applyToneAndClarity(fullResBase, state.hdrToneAdjustments)
+                        needsFullResAstroPost ->
+                            AstroPostEngine.applyPostProcessing(fullResBase, state.astroStretchAdjustments)
+                        else -> fullResBase
+                    }
+
+                    try {
+                        mediaStoreExporter.saveToGallery(
+                            bitmap = exportBitmap,
+                            settings = state.outputSettings,
+                            referenceFrameUri = result.referenceFrameUri
+                        )
+                    } finally {
+                        if ((needsFullResHdrTone || needsFullResAstroPost) &&
+                            exportBitmap !== fullResBase &&
+                            !exportBitmap.isRecycled
+                        ) {
+                            exportBitmap.recycle()
+                        }
+                    }
+                }
                 _uiState.update {
                     it.copy(
                         isSaving = false,
@@ -856,6 +1363,10 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
             it.copy(
                 frames = emptyList(),
                 selectedPreviewIndex = 0,
+                hdrAnchorFrameId = null,
+                hdrToneAdjustments = HdrToneAdjustments(),
+                astroFreezeGroundStrokes = emptyList(),
+                astroStretchAdjustments = AstroStretchAdjustments(),
                 result = null,
                 retouchBitmapVersion = 0,
                 lastSavedPath = null,
@@ -879,6 +1390,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
 
     private fun clearRetouchAndPeakingState() {
         peakingJob?.cancel()
+        toneJob?.cancel()
         undoStrokes.clear()
         redoStrokes.clear()
 
@@ -893,6 +1405,16 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         }
         activeRetouchSourceBitmap = null
         activeRetouchSourceIndex = -1
+
+        if (tonePreviewBaseBitmap != null &&
+            tonePreviewBaseBitmap !== result?.outputBitmap &&
+            tonePreviewBaseBitmap !== workingOutputBitmap &&
+            tonePreviewBaseBitmap !== baseOutputBitmap &&
+            tonePreviewBaseBitmap?.isRecycled == false
+        ) {
+            tonePreviewBaseBitmap?.recycle()
+        }
+        tonePreviewBaseBitmap = null
 
         if (baseOutputBitmap != null && baseOutputBitmap !== result?.outputBitmap && baseOutputBitmap?.isRecycled == false) {
             baseOutputBitmap?.recycle()
@@ -912,6 +1434,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
                 retouchRedoCount = 0,
                 retouchMaskBitmap = null,
                 isApplyingRetouch = false,
+                isApplyingTone = false,
                 isFocusPeakingEnabled = false,
                 focusPeakingOverlayBitmap = null,
                 comparePeakingOverlayBitmap = null,
@@ -933,6 +1456,7 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         stackingJob?.cancel()
         analysisJob?.cancel()
         peakingJob?.cancel()
+        toneJob?.cancel()
         clearRetouchAndPeakingState()
         recycleResultBitmaps(_uiState.value.result)
     }
