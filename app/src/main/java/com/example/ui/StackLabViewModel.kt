@@ -216,6 +216,12 @@ class StackLabViewModel(application: Application) : AndroidViewModel(application
         mode: StackMode? = null
     ) {
         if (uris.isEmpty()) return
+        val switchingMode = navigateToWorkspace && mode != null && mode != _uiState.value.activeMode
+        if (switchingMode) {
+            analysisJob?.cancel()
+            clearRetouchAndPeakingState()
+            recycleResultBitmaps(_uiState.value.result)
+        }
         viewModelScope.launch {
             val newFrames = withContext(Dispatchers.IO) {
                 bitmapLoader.inspectFrames(uris)

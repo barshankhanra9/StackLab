@@ -2,7 +2,10 @@
     <string name="app_name">StackLab</string>
     <string name="cd_settings">Output Settings</string>
     <string name="cd_back">Navigate back</string>
+    <string name="cd_stacklab_logo">StackLab emblem</string>
     <string name="cd_focus_stack_hero">Macro photograph showing edge-to-edge focus depth</string>
+    <string name="cd_hdr_blend_hero">Golden-hour alpine architecture showing high dynamic range tone balance</string>
+    <string name="cd_astro_stack_hero">Milky Way starfield rising above dark mountain peaks</string>
     <string name="cd_remove_frame">Remove frame</string>
     <string name="cd_toggle_frame">Toggle frame inclusion</string>
     <string name="cd_move_frame_left">Move frame earlier</string>

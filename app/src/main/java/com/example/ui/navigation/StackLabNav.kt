@@ -62,11 +62,11 @@ fun StackLabNav(
         composable<HomeRoute> {
             HomeScreen(
                 uiState = uiState,
-                onPhotosPicked = { uris ->
+                onPhotosPicked = { uris, mode ->
                     viewModel.onPhotosSelected(
                         uris = uris,
                         navigateToWorkspace = true,
-                        mode = com.example.domain.model.StackMode.FocusStack
+                        mode = mode
                     )
                 },
                 onHdrModeClicked = viewModel::openHdrWorkspace,
