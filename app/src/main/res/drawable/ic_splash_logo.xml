@@ -8,8 +8,8 @@
         </shape>
     </item>
     <item
-        android:width="64dp"
-        android:height="64dp"
+        android:width="58dp"
+        android:height="58dp"
         android:drawable="@drawable/img_stacklab_logo"
         android:gravity="center" />
 </layer-list>
